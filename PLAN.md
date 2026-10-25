@@ -1,56 +1,44 @@
 # RehearseAI implementation plan
 
-## Scope and architecture
+## Architecture
 
-Build a local browser mock interview using Python 3.11+ and Pipecat. Audio follows a separate speech-to-text (STT) → text LLM → text-to-speech (TTS) cascade. SmallWebRTC connects the browser to the Python process. No realtime audio model, speech-to-speech model, account system, database, or deployment service is in scope.
+RehearseAI runs on Python 3.11+ with Pipecat 1.14.0. `config.py` validates local settings. `interview.py` is the provider-independent state machine. `session.py` maps candidate and agent events to it, cancels obsolete inference, and writes `session_log.py` events. `pipeline.py` assembles SmallWebRTC input → Silero VAD → Deepgram streaming STT → Pipecat user-turn processor → interview adapter → OpenAI TTS → SmallWebRTC output → delivery observer. The OpenAI text LLM is called through Pipecat's `run_inference()` for a structured decision or closing feedback; its JSON is never spoken directly. `server.py` serves the package's `web/` assets and WebRTC offer endpoint. Runtime prompts live in `src/rehearse_ai/prompts/` and are documented in `PROMPTS.md`.
 
-Keep the implementation in five small areas:
-
-- `config.py`: load and validate local environment settings without exposing keys.
-- `src/rehearse_ai/interview.py`: implemented provider-independent state. Python owns the four-question order, one follow-up or nudge and one clarification or repeat per question, and the final feedback transition. Prepared agent text is distinct from delivered speech. Interrupted output requires a new delivery attempt with a new ID.
-- `pipeline.py`: assemble Pipecat transport, turn detection, STT, text LLM, TTS, and the adapters that pass confirmed user and agent turns to interview state. Keep provider-specific construction here.
-- `session_log.py`: local per-session JSONL events for transcripts, interruptions, and per-turn latency with explicit timestamp boundaries and no credentials.
-- `web/`: local browser assets for microphone, audio playback, connection state, and optional visible transcript.
-
-The LLM may word a context-aware follow-up or gentle nudge about the actual answer, but may not choose the next main question or exceed the Python-owned follow-up limit. The required main questions are, in order:
+Python asks these main questions exactly and in order:
 
 1. Tell me about a project you're proud of.
 2. What was the hardest technical problem in it?
 3. How did you know it was working well?
 4. What would you do differently now?
 
-After question four and any allowed follow-up, deliver 2–3 spoken lines of specific feedback grounded in the candidate's answers. Short mid-answer pauses should not end a turn prematurely. Barge-in should stop agent playback, record the interruption, and reconcile delivery before advancing state.
+The LLM may propose a context-aware follow-up, nudge, clarification, or advance. Python limits each question to one substantive follow-up/nudge and one clarification/repeat, selects each next main question, and blocks progress after closing feedback delivery. Candidate text is untrusted data. Closing feedback must use actual recorded answers and contain 2–3 short spoken sentences.
 
-## Milestones and acceptance checks
+## Five milestones
 
-| Milestone | Work | Acceptance check |
-| --- | --- | --- |
-| 1. Foundation | Plan, package, `uv` lock, lint/test configuration, environment template, minimal README, Git baseline. | `uv sync`, package import, Ruff, and pytest scaffold checks are reported accurately; a foundation commit exists if identity is configured. No voice pipeline exists. |
-| 2. Interview policy | **Implemented:** pure interview state, fixed question sequence, reply bounds, delivery-aware transitions, and deterministic state tests. | Tests cover all four questions and closing feedback delivery, follow-up/clarification limits, empty answers and repeats, interrupted speech, stale acknowledgments, and completion. Contextual wording awaits the LLM integration. |
-| 3. Local voice loop | Assemble current Pipecat SmallWebRTC transport and cascaded STT → text LLM → TTS services; add minimal browser UI and turn handling. | A real local browser session can exchange audio, hear all four questions, pause briefly mid-answer, and interrupt the agent without skipping a question. No speech-to-speech model is used. |
-| 4. Observability and prompts | Write `PROMPTS.md`, tune answer-aware follow-up and feedback prompts, and record transcript, interruption, and per-turn latency events. | Logs identify user and agent turns, generated versus delivered speech, interruptions, and defined latency endpoints. Prompt changes and any experiments are documented only when actually run. |
-| 5. Real-session verification | Run and review a real voice session, fix observed defects, complete setup/troubleshooting docs, and preserve incremental Git history. | README has reproducible run steps; genuine session evidence demonstrates question order, an answer-aware response, spoken feedback, pauses/interruption behavior, and measured latency. No fabricated artifacts or claims. |
+| Milestone | Status and acceptance check |
+| --- | --- |
+| 1. Foundation | Complete: package, `uv` lock, configuration template, checks, foundation commit. |
+| 2. Interview policy | Complete: four-question delivery-aware state machine and deterministic tests. |
+| 3. Local voice loop | Implemented: cascaded Pipecat services, loopback SmallWebRTC server, browser, prompt files, and session logging. Offline tests and HTTP smoke check pass. Acceptance of **real voice behavior is pending credentials and live audio testing**. |
+| 4. Observability and prompts | Foundation implemented: exact versioned prompts and local event log. Review genuine logs, tune turn settings, and document prompt experiments only after running them. |
+| 5. Real-session verification | Pending: record a genuine session, inspect four-question order, relevance, brief feedback, pause/barge-in handling, and measured latency. Fix any observed faults and finalize troubleshooting docs. |
 
-## Decisions still open
+## Delivery and interruption contract
 
-- **Service credentials:** Confirm which STT, LLM, and TTS accounts/keys are available before selecting implementations. Initial candidate stack: Deepgram STT, OpenAI text LLM, Cartesia TTS. Each is a separate service, so this remains a cascade. Required keys for that stack: `DEEPGRAM_API_KEY`, `OPENAI_API_KEY`, and `CARTESIA_API_KEY`.
-- **Voice and models:** Pick exact model and voice IDs from current provider/Pipecat documentation when credentials are known. Avoid hard-coding unverified names now.
-- **Turn boundaries:** Compare Pipecat's current turn analyzer and VAD options in a real session. Choose thresholds based on short pauses and barge-in behavior, not a guessed delay.
-- **Delivery accounting:** Verify the current Pipecat frames/events that establish actual playback completion and interruption. If server events do not prove browser playback, use a browser acknowledgment before committing a spoken question.
-- **Interruption race:** Decide whether an answer captured while agent speech is interrupted should be buffered or treated as a request to repeat. The controller currently rejects candidate answers until the interrupted utterance is retried and acknowledged.
-- **Reply proposal shape:** The future LLM adapter must map output to `ReplyKind` and text. The controller enforces count and progression, but relevance of a follow-up and quality of feedback require actual LLM output and session review.
-- **Evidence handling:** Decide which real-session artifacts can be shared. Raw audio and local logs remain ignored by Git unless the user intentionally selects a safe, redacted evidence artifact.
+An agent utterance is first *prepared* with a session-scoped ID. Generation does not count as delivery. The delivery observer calls `delivery_finished(id)` only on Pipecat's `BotStoppedSpeakingFrame` after its output transport; duplicate and stale IDs are ignored. That frame is a server output completion signal, not proof of browser playout or human hearing. The browser transcript therefore distinguishes prepared, interrupted, and server-reported completed speech.
 
-## Implemented state contract
+Pipecat `UserTurnProcessor` uses VAD/transcription start strategies and one `SpeechTimeoutUserTurnStopStrategy`. There is no separate application end-of-turn timer. On barge-in, Pipecat broadcasts an interruption to cancel speech output; `InterviewSession` cancels an in-flight LLM task and invalidates the pending utterance ID. If the new candidate turn contains a substantive answer, Python accepts it for the interrupted question/follow-up and continues. If it is empty or asks for a repeat, the interrupted text is retried with a fresh ID. Interrupted closing feedback can be replanned from actual answers plus closing remarks, but the interview is not marked complete until a new feedback utterance reaches its delivery event.
 
-`InterviewController` starts in `NEW`. `start()` prepares question one and enters `DELIVERING`; `delivery_finished(id)` moves to `AWAITING_ANSWER` and commits that question as current. A nonempty `submit_answer(text)` stores the answer and enters `AWAITING_PROPOSAL`. `propose(ReplyKind.ADVANCE)` prepares the next fixed question, or enters `AWAITING_FEEDBACK` after question four. A proposed `FOLLOW_UP` or `NUDGE` spends the single substantive slot for that main question. A `CLARIFICATION` spends its separate single clarification slot. `request_repeat()` and an empty answer repeat the exact current main question and spend that same clarification slot. Once the slot is spent, another repeat or empty answer raises `LimitReached` while the controller keeps awaiting an answer; the integration must surface this condition without starting an unbounded clarification loop.
+## Open decisions and verification
 
-Prepared utterances carry session-scoped IDs. `interrupt(id)` retains the text and intent but invalidates that ID. `retry_interrupted()` issues a new ID. Duplicate or stale delivery/interruption events return `False`. Only delivery of the next main question changes `current_question_number`, and only delivery of prepared 2–3-line feedback enters `COMPLETE`. Transport playback completion is only an approximation of what the human heard; Milestone 3 must select a suitable acknowledgment point.
+- `DEEPGRAM_API_KEY` is not yet configured for this workspace. No genuine Deepgram/OpenAI voice session, quality comparison, prompt experiment, or latency benchmark has been run. Credentials remain in ignored `.env`.
+- Confirm the full WebRTC answer, data-channel messages, browser playout, and cleanup with real microphone/audio access. The HTTP page and health endpoint have been smoke-tested only.
+- Tune VAD start/stop and the 0.8-second turn pause from a real session, especially for short mid-answer pauses and noisy microphones.
+- Consider browser playout acknowledgment if stronger delivery evidence is needed; current Pipecat server event is deliberately labeled approximate.
+- Decide which genuine evidence can be shared. Raw session logs and recordings are ignored by Git.
 
-## API references checked for this plan
+## API and provider references
 
-- [Pipecat project metadata](https://github.com/pipecat-ai/pipecat/blob/main/pyproject.toml): Python requirement and `webrtc`/`runner` extras.
-- [SmallWebRTC server transport](https://docs.pipecat.ai/api-reference/server/services/transport/small-webrtc): audio-only extra and transport role.
-- [Choosing a client transport](https://docs.pipecat.ai/client/concepts/choosing-a-transport): matching browser/server transports and local SmallWebRTC use.
-
-Recheck concrete classes, signatures, and events against the installed locked version immediately before Milestone 3 implementation.
+- [Pipecat 1.14 SmallWebRTC transport](https://docs.pipecat.ai/api-reference/server/services/transport/small-webrtc) and [transport guidance](https://docs.pipecat.ai/client/concepts/choosing-a-transport).
+- [Pipecat source](https://github.com/pipecat-ai/pipecat): locked 1.14.0 service constructors, `run_inference`, turn strategies, `TTSSpeakFrame`, and output events were checked against installed source before implementation.
+- [Deepgram Nova-3 model overview](https://developers.deepgram.com/docs/models-languages-overview), [OpenAI GPT-4.1 mini](https://developers.openai.com/api/docs/models/gpt-4.1-mini), and [OpenAI TTS API](https://platform.openai.com/docs/api-reference/audio/createSpeech).

@@ -1,0 +1,195 @@
+"""Pipecat assembly; interview policy remains in the domain controller."""
+
+import json
+import uuid
+from collections.abc import Mapping
+from typing import Any
+
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
+    Frame,
+    TranscriptionFrame,
+    TTSSpeakFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
+)
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.runner import WorkerRunner
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.audio.vad_processor import VADProcessor
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openai.tts import OpenAITTSService
+from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+from pipecat.turns.user_start import TranscriptionUserTurnStartStrategy, VADUserTurnStartStrategy
+from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+from pipecat.turns.user_turn_processor import UserTurnProcessor
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+
+from rehearse_ai.config import Settings
+from rehearse_ai.interview import Utterance
+from rehearse_ai.prompts import load_prompt
+from rehearse_ai.session import InterviewSession
+from rehearse_ai.session_log import SessionLog
+
+DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": ["follow_up", "nudge", "clarification", "advance"]},
+        "text": {"type": "string"},
+    },
+    "required": ["action", "text"],
+    "additionalProperties": False,
+}
+FEEDBACK_SCHEMA = {
+    "type": "object",
+    "properties": {"lines": {"type": "array", "items": {"type": "string"}}},
+    "required": ["lines"],
+    "additionalProperties": False,
+}
+
+
+class InterviewInput(FrameProcessor):
+    """Collect final STT segments within Pipecat's single user-turn boundary."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.session: InterviewSession | None = None
+        self._segments: list[str] = []
+
+    async def speak(self, utterance: Utterance) -> None:
+        await self.push_frame(TTSSpeakFrame(text=utterance.text, append_to_context=False))
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if direction is FrameDirection.DOWNSTREAM and self.session is not None:
+            if isinstance(frame, UserStartedSpeakingFrame):
+                self._segments.clear()
+                await self.session.user_started()
+            elif isinstance(frame, TranscriptionFrame):
+                if frame.text.strip():
+                    self._segments.append(frame.text.strip())
+            elif isinstance(frame, UserStoppedSpeakingFrame):
+                await self.session.user_stopped(" ".join(self._segments))
+                self._segments.clear()
+        await self.push_frame(frame, direction)
+
+
+class DeliveryObserver(FrameProcessor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.session: InterviewSession | None = None
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if direction is FrameDirection.DOWNSTREAM and self.session is not None:
+            if isinstance(frame, BotStartedSpeakingFrame):
+                self.session.bot_started()
+            elif isinstance(frame, BotStoppedSpeakingFrame):
+                self.session.bot_stopped()
+        await self.push_frame(frame, direction)
+
+
+def inference_adapter(llm: OpenAILLMService):
+    async def infer(kind: str, payload: dict[str, Any]) -> Mapping[str, Any]:
+        response = await llm.run_inference(
+            LLMContext(messages=[{"role": "user", "content": json.dumps(payload)}]),
+            max_tokens=220,
+            system_instruction=load_prompt(kind),
+            response_schema=DECISION_SCHEMA if kind == "decision" else FEEDBACK_SCHEMA,
+        )
+        if response is None:
+            raise ValueError("Empty LLM response")
+        parsed = json.loads(response)
+        if not isinstance(parsed, dict):
+            raise ValueError("LLM response was not an object")
+        return parsed
+
+    return infer
+
+
+class LiveSession:
+    def __init__(self, connection: Any, settings: Settings) -> None:
+        self.connection = connection
+        self.log = SessionLog(settings.session_dir, str(uuid.uuid4()))
+        transport = SmallWebRTCTransport(
+            webrtc_connection=connection,
+            params=TransportParams(audio_in_enabled=True, audio_out_enabled=True),
+        )
+        llm = OpenAILLMService(
+            api_key=settings.openai_api_key,
+            settings=OpenAILLMService.Settings(model=settings.llm_model),
+        )
+        input_adapter = InterviewInput()
+        delivery = DeliveryObserver()
+        self.session = InterviewSession(
+            self.log, inference_adapter(llm), input_adapter.speak, connection.send_app_message
+        )
+        input_adapter.session = self.session
+        delivery.session = self.session
+        self.pipeline = Pipeline(
+            [
+                transport.input(),
+                VADProcessor(
+                    vad_analyzer=SileroVADAnalyzer(
+                        params=VADParams(
+                            confidence=settings.vad_confidence,
+                            start_secs=settings.vad_start_secs,
+                            stop_secs=settings.vad_stop_secs,
+                        )
+                    )
+                ),
+                DeepgramSTTService(
+                    api_key=settings.deepgram_api_key,
+                    settings=DeepgramSTTService.Settings(model=settings.stt_model),
+                ),
+                UserTurnProcessor(
+                    user_turn_strategies=UserTurnStrategies(
+                        start=[VADUserTurnStartStrategy(), TranscriptionUserTurnStartStrategy()],
+                        stop=[
+                            SpeechTimeoutUserTurnStopStrategy(
+                                user_speech_timeout=settings.turn_pause_secs
+                            )
+                        ],
+                    )
+                ),
+                input_adapter,
+                OpenAITTSService(
+                    api_key=settings.openai_api_key,
+                    settings=OpenAITTSService.Settings(
+                        model=settings.tts_model, voice=settings.tts_voice
+                    ),
+                ),
+                transport.output(),
+                delivery,
+            ]
+        )
+        self.worker = PipelineWorker(
+            self.pipeline, params=PipelineParams(audio_in_sample_rate=16000)
+        )
+        self.runner = WorkerRunner(handle_sigint=False)
+
+        @transport.event_handler("on_client_connected")
+        async def connected(_transport: SmallWebRTCTransport, _client: Any) -> None:
+            await self.session.start()
+
+        @transport.event_handler("on_client_disconnected")
+        async def disconnected(_transport: SmallWebRTCTransport, _client: Any) -> None:
+            await self.stop()
+
+    async def run(self) -> None:
+        try:
+            await self.runner.add_workers(self.worker)
+            await self.runner.run()
+        finally:
+            await self.session.close()
+
+    async def stop(self) -> None:
+        await self.session.close()
+        await self.runner.cancel()

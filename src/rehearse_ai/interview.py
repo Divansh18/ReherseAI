@@ -69,6 +69,7 @@ class InterviewController:
         self._pending: Utterance | None = None
         self._interrupted: Utterance | None = None
         self._answers: list[list[str]] = [[] for _ in QUESTIONS]
+        self._closing_remarks: list[str] = []
         self._follow_ups = [0] * len(QUESTIONS)
         self._clarifications = [0] * len(QUESTIONS)
 
@@ -95,6 +96,10 @@ class InterviewController:
     @property
     def answers(self) -> tuple[tuple[str, ...], ...]:
         return tuple(tuple(turns) for turns in self._answers)
+
+    @property
+    def closing_remarks(self) -> tuple[str, ...]:
+        return tuple(self._closing_remarks)
 
     def start(self) -> Utterance:
         self._require(Stage.NEW)
@@ -191,6 +196,46 @@ class InterviewController:
             raise InvalidTransition("There is no interrupted utterance to retry")
         self._interrupted = None
         return self._prepare(utterance.kind, utterance.text, self._index_for(utterance))
+
+    def accept_barge_in_answer(self, text: str) -> bool:
+        """Use a substantive answer to resolve interrupted speech without replaying it.
+
+        An answer to a partly heard main question explicitly commits that
+        question. Empty transcription leaves the utterance recoverable.
+        """
+        self._require(Stage.DELIVERING)
+        interrupted = self._interrupted
+        if interrupted is None:
+            raise InvalidTransition("There is no interrupted utterance")
+        answer = text.strip()
+        if not answer:
+            return False
+        if interrupted.kind is UtteranceKind.FEEDBACK:
+            self._closing_remarks.append(answer)
+            self._stage = Stage.AWAITING_FEEDBACK
+        else:
+            if interrupted.kind is UtteranceKind.QUESTION:
+                if interrupted.question_number is None:
+                    raise RuntimeError("Question utterance has no question number")
+                self._question_index = interrupted.question_number - 1
+            self._answers[self._question_index].append(answer)
+            self._stage = Stage.AWAITING_PROPOSAL
+        self._interrupted = None
+        return True
+
+    def add_answer_continuation(self, text: str) -> None:
+        """Extend the latest answer when speech resumes during LLM planning."""
+        self._require(Stage.AWAITING_PROPOSAL)
+        continuation = text.strip()
+        if continuation:
+            latest = self._answers[self._question_index]
+            latest[-1] = f"{latest[-1]} {continuation}"
+
+    def add_closing_remarks(self, text: str) -> None:
+        """Retain speech that arrives while closing feedback is being planned."""
+        self._require(Stage.AWAITING_FEEDBACK)
+        if remark := text.strip():
+            self._closing_remarks.append(remark)
 
     def _index_for(self, utterance: Utterance) -> int | None:
         return utterance.question_number - 1 if utterance.question_number is not None else None

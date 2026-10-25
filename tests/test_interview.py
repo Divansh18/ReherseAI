@@ -170,6 +170,39 @@ def test_interrupted_closing_response_does_not_complete() -> None:
     assert controller.stage is Stage.COMPLETE
 
 
+def test_substantive_barge_in_resolves_interrupted_main_question() -> None:
+    controller = InterviewController()
+    first = controller.start()
+    assert controller.interrupt(first.id)
+    assert controller.accept_barge_in_answer("I built a parser")
+    assert controller.current_question_number == 1
+    assert controller.answers[0] == ("I built a parser",)
+    assert controller.stage is Stage.AWAITING_PROPOSAL
+    assert not controller.delivery_finished(first.id)
+
+
+def test_interrupted_follow_up_accepts_answer_without_spending_another_slot() -> None:
+    controller = InterviewController()
+    start_and_answer(controller)
+    follow_up = controller.propose(ReplyKind.FOLLOW_UP, "What was your role?")
+    assert controller.interrupt(follow_up.id)
+    assert controller.accept_barge_in_answer("I designed the parser")
+    assert controller.answers[0][-1] == "I designed the parser"
+    with pytest.raises(LimitReached):
+        controller.propose(ReplyKind.NUDGE, "Say more")
+
+
+def test_interrupted_feedback_can_be_replanned_but_not_marked_complete() -> None:
+    controller = InterviewController()
+    reach_feedback(controller)
+    feedback = controller.prepare_feedback("Clear story.\nAdd a result next time.")
+    assert controller.interrupt(feedback.id)
+    assert controller.accept_barge_in_answer("Thank you")
+    assert controller.closing_remarks == ("Thank you",)
+    assert controller.stage is Stage.AWAITING_FEEDBACK
+    assert not controller.delivery_finished(feedback.id)
+
+
 def test_duplicate_and_stale_delivery_and_interruption_events_are_ignored() -> None:
     controller = InterviewController()
     first = controller.start()
