@@ -1,0 +1,212 @@
+"""Provider-independent interview policy and speech delivery state."""
+
+from dataclasses import dataclass
+from enum import Enum, auto
+
+QUESTIONS = (
+    "Tell me about a project you're proud of.",
+    "What was the hardest technical problem in it?",
+    "How did you know it was working well?",
+    "What would you do differently now?",
+)
+
+MAX_FOLLOW_UPS_PER_QUESTION = 1
+MAX_CLARIFICATIONS_PER_QUESTION = 1
+
+
+class Stage(Enum):
+    NEW = auto()
+    DELIVERING = auto()
+    AWAITING_ANSWER = auto()
+    AWAITING_PROPOSAL = auto()
+    AWAITING_FEEDBACK = auto()
+    COMPLETE = auto()
+
+
+class ReplyKind(Enum):
+    FOLLOW_UP = auto()
+    NUDGE = auto()
+    CLARIFICATION = auto()
+    ADVANCE = auto()
+
+
+class UtteranceKind(Enum):
+    QUESTION = auto()
+    FOLLOW_UP = auto()
+    NUDGE = auto()
+    CLARIFICATION = auto()
+    REPEAT = auto()
+    FEEDBACK = auto()
+
+
+@dataclass(frozen=True)
+class Utterance:
+    id: int
+    kind: UtteranceKind
+    text: str
+    question_number: int | None
+
+
+class InvalidTransition(ValueError):
+    """An event is not valid in the current interview stage."""
+
+
+class LimitReached(InvalidTransition):
+    """The current question's follow-up or clarification budget is spent."""
+
+
+class InterviewController:
+    """One session's question order, reply budgets, and delivery accounting.
+
+    IDs are scoped to this controller. A delivery acknowledgment means the
+    transport reports playback completed, not that a human heard every word.
+    """
+
+    def __init__(self) -> None:
+        self._stage = Stage.NEW
+        self._question_index = -1
+        self._next_utterance_id = 1
+        self._pending: Utterance | None = None
+        self._interrupted: Utterance | None = None
+        self._answers: list[list[str]] = [[] for _ in QUESTIONS]
+        self._follow_ups = [0] * len(QUESTIONS)
+        self._clarifications = [0] * len(QUESTIONS)
+
+    @property
+    def stage(self) -> Stage:
+        return self._stage
+
+    @property
+    def current_question_number(self) -> int | None:
+        return self._question_index + 1 if self._question_index >= 0 else None
+
+    @property
+    def current_question(self) -> str | None:
+        return QUESTIONS[self._question_index] if self._question_index >= 0 else None
+
+    @property
+    def pending(self) -> Utterance | None:
+        return self._pending
+
+    @property
+    def interrupted_utterance(self) -> Utterance | None:
+        return self._interrupted
+
+    @property
+    def answers(self) -> tuple[tuple[str, ...], ...]:
+        return tuple(tuple(turns) for turns in self._answers)
+
+    def start(self) -> Utterance:
+        self._require(Stage.NEW)
+        return self._prepare(UtteranceKind.QUESTION, QUESTIONS[0], 0)
+
+    def submit_answer(self, text: str) -> Utterance | None:
+        """Record a candidate turn; an empty turn requests one bounded repeat."""
+        self._require(Stage.AWAITING_ANSWER)
+        answer = text.strip()
+        if not answer:
+            return self.request_repeat()
+        self._answers[self._question_index].append(answer)
+        self._stage = Stage.AWAITING_PROPOSAL
+        return None
+
+    def request_repeat(self) -> Utterance:
+        """Repeat the current main question, spending its clarification budget."""
+        self._require(Stage.AWAITING_ANSWER)
+        index = self._question_index
+        if self._clarifications[index] >= MAX_CLARIFICATIONS_PER_QUESTION:
+            raise LimitReached("Clarification limit reached for this question")
+        self._clarifications[index] += 1
+        return self._prepare(UtteranceKind.REPEAT, QUESTIONS[index], index)
+
+    def propose(self, kind: ReplyKind, text: str | None = None) -> Utterance | None:
+        """Accept a bounded LLM proposal; Python selects the next question."""
+        self._require(Stage.AWAITING_PROPOSAL)
+        if not isinstance(kind, ReplyKind):
+            raise ValueError("Unknown reply kind")
+        index = self._question_index
+        if kind is ReplyKind.ADVANCE:
+            if text is not None:
+                raise ValueError("ADVANCE cannot supply speech text")
+            if index == len(QUESTIONS) - 1:
+                self._stage = Stage.AWAITING_FEEDBACK
+                return None
+            return self._prepare(UtteranceKind.QUESTION, QUESTIONS[index + 1], index + 1)
+
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Spoken proposal text must be nonempty")
+        if kind is ReplyKind.CLARIFICATION:
+            if self._clarifications[index] >= MAX_CLARIFICATIONS_PER_QUESTION:
+                raise LimitReached("Clarification limit reached for this question")
+            self._clarifications[index] += 1
+            utterance_kind = UtteranceKind.CLARIFICATION
+        else:
+            if self._follow_ups[index] >= MAX_FOLLOW_UPS_PER_QUESTION:
+                raise LimitReached("Follow-up limit reached for this question")
+            self._follow_ups[index] += 1
+            utterance_kind = (
+                UtteranceKind.FOLLOW_UP if kind is ReplyKind.FOLLOW_UP else UtteranceKind.NUDGE
+            )
+        return self._prepare(utterance_kind, text.strip(), index)
+
+    def prepare_feedback(self, text: str) -> Utterance:
+        """Queue actual session feedback supplied by the future LLM adapter."""
+        self._require(Stage.AWAITING_FEEDBACK)
+        lines = text.splitlines()
+        if not 2 <= len(lines) <= 3 or any(not line.strip() for line in lines):
+            raise ValueError("Closing feedback must have 2 or 3 nonempty lines")
+        return self._prepare(UtteranceKind.FEEDBACK, text, None)
+
+    def delivery_finished(self, utterance_id: int) -> bool:
+        """Apply only the current pending delivery; ignore duplicate or stale IDs."""
+        utterance = self._pending
+        if utterance is None or utterance.id != utterance_id:
+            return False
+        self._pending = None
+        if utterance.kind is UtteranceKind.QUESTION:
+            if utterance.question_number is None:
+                raise RuntimeError("Question utterance has no question number")
+            self._question_index = utterance.question_number - 1
+            self._stage = Stage.AWAITING_ANSWER
+        elif utterance.kind is UtteranceKind.FEEDBACK:
+            self._stage = Stage.COMPLETE
+        else:
+            self._stage = Stage.AWAITING_ANSWER
+        return True
+
+    def interrupt(self, utterance_id: int) -> bool:
+        """Keep interrupted speech recoverable and invalidate its old ID."""
+        utterance = self._pending
+        if utterance is None or utterance.id != utterance_id:
+            return False
+        self._pending = None
+        self._interrupted = utterance
+        return True
+
+    def retry_interrupted(self) -> Utterance:
+        """Requeue interrupted text with a fresh ID after barge-in has settled."""
+        self._require(Stage.DELIVERING)
+        utterance = self._interrupted
+        if utterance is None:
+            raise InvalidTransition("There is no interrupted utterance to retry")
+        self._interrupted = None
+        return self._prepare(utterance.kind, utterance.text, self._index_for(utterance))
+
+    def _index_for(self, utterance: Utterance) -> int | None:
+        return utterance.question_number - 1 if utterance.question_number is not None else None
+
+    def _prepare(self, kind: UtteranceKind, text: str, index: int | None) -> Utterance:
+        utterance = Utterance(
+            id=self._next_utterance_id,
+            kind=kind,
+            text=text,
+            question_number=index + 1 if index is not None else None,
+        )
+        self._next_utterance_id += 1
+        self._pending = utterance
+        self._stage = Stage.DELIVERING
+        return utterance
+
+    def _require(self, stage: Stage) -> None:
+        if self._stage is not stage:
+            raise InvalidTransition(f"Expected {stage.name}; current stage is {self._stage.name}")

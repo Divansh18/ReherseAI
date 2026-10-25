@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "interview-coach"
+name = "rehearse-ai"
 version = "0.1.0"
-description = "Local voice mock-interview coach built with Pipecat"
+description = "RehearseAI local voice mock-interview coach"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
