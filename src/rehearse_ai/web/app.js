@@ -99,8 +99,17 @@ function handleEvent(message) {
     status('Interview ended early', 'Microphone still connected', true);
   } else if (entry.event === 'clarification_limit') {
     status('Please answer the current question', 'Microphone on', true);
+  } else if (entry.event === 'opening_repeat_limit') {
+    status(
+      entry.opening_phase === 'greeting'
+        ? 'Tell the coach how you are doing to continue'
+        : 'Say “start” when ready, or “end the interview” to stop',
+      'Microphone on', true,
+    );
+  } else if (entry.event === 'opening_waiting_for_readiness') {
+    status('Say “start” when ready, or “end the interview” to stop', 'Microphone on', true);
   } else if (entry.event === 'response_error') {
-    showError('The coach could not prepare a reply. End and restart this session.');
+    showError('The voice service could not complete a response. End and restart this session.');
   }
 }
 
@@ -156,8 +165,12 @@ async function startSession() {
     peer = new RTCPeerConnection();
     microphone.getAudioTracks().forEach((track) => peer.addTrack(track, microphone));
     channel = peer.createDataChannel('rehearseai');
+    const activeChannel = channel;
     channel.onmessage = (event) => {
       try { handleEvent(JSON.parse(event.data)); } catch { /* Ignore unrelated data. */ }
+    };
+    channel.onclose = () => {
+      if (channel === activeChannel && peer) showError('The session connection closed. End and restart the session.');
     };
     peer.ontrack = (event) => {
       audio.srcObject = event.streams[0] || new MediaStream([event.track]);

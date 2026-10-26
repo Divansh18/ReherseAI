@@ -15,6 +15,10 @@ READINESS_PROMPT = (
     "Are you ready to begin?"
 )
 READINESS_WAIT = "No rush. Tell me when you're ready to begin."
+READINESS_CLARIFICATION = (
+    "I didn't catch whether you're ready. Say 'start' when you are, or 'not yet' "
+    "if you need a moment."
+)
 
 MAX_FOLLOW_UPS_PER_QUESTION = 1
 MAX_CLARIFICATIONS_PER_QUESTION = 1
@@ -46,6 +50,7 @@ class UtteranceKind(Enum):
     GREETING = auto()
     READINESS = auto()
     OPENING_WAIT = auto()
+    OPENING_CLARIFICATION = auto()
     QUESTION = auto()
     FOLLOW_UP = auto()
     NUDGE = auto()
@@ -91,6 +96,7 @@ class InterviewController:
         self._greeting_response = ""
         self._opening_repeats = {Stage.AWAITING_GREETING: 0, Stage.AWAITING_READINESS: 0}
         self._readiness_nudges = 0
+        self._readiness_clarifications = 0
 
     @property
     def stage(self) -> Stage:
@@ -179,6 +185,13 @@ class InterviewController:
             return None
         self._readiness_nudges += 1
         return self._prepare(UtteranceKind.OPENING_WAIT, READINESS_WAIT, None)
+
+    def clarify_readiness(self) -> Utterance | None:
+        self._require(Stage.AWAITING_READINESS)
+        if self._readiness_clarifications >= 1:
+            return None
+        self._readiness_clarifications += 1
+        return self._prepare(UtteranceKind.OPENING_CLARIFICATION, READINESS_CLARIFICATION, None)
 
     def request_opening_repeat(self) -> Utterance:
         phase = (
@@ -333,7 +346,11 @@ class InterviewController:
         self._pending = None
         if utterance.kind is UtteranceKind.GREETING:
             self._stage = Stage.AWAITING_GREETING
-        elif utterance.kind in {UtteranceKind.READINESS, UtteranceKind.OPENING_WAIT}:
+        elif utterance.kind in {
+            UtteranceKind.READINESS,
+            UtteranceKind.OPENING_WAIT,
+            UtteranceKind.OPENING_CLARIFICATION,
+        }:
             self._stage = Stage.AWAITING_READINESS
         elif utterance.kind is UtteranceKind.QUESTION:
             if utterance.question_number is None:
@@ -382,7 +399,11 @@ class InterviewController:
         if interrupted.kind is UtteranceKind.GREETING:
             self._greeting_response = answer
             self._stage = Stage.AWAITING_OPENING_ACK
-        elif interrupted.kind in {UtteranceKind.READINESS, UtteranceKind.OPENING_WAIT}:
+        elif interrupted.kind in {
+            UtteranceKind.READINESS,
+            UtteranceKind.OPENING_WAIT,
+            UtteranceKind.OPENING_CLARIFICATION,
+        }:
             self._stage = Stage.AWAITING_READINESS
         elif interrupted.kind is UtteranceKind.FEEDBACK:
             self._closing_remarks.append(answer)

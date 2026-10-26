@@ -283,6 +283,12 @@ class LiveSession:
         )
         self.runner = WorkerRunner(handle_sigint=False)
 
+        @self.worker.event_handler("on_pipeline_error")
+        async def pipeline_error(_worker: PipelineWorker, frame: Any) -> None:
+            category = frame.category.value if frame.category is not None else None
+            processor = type(frame.processor).__name__ if frame.processor is not None else None
+            self.session.pipeline_error(processor=processor, category=category)
+
         @transport.event_handler("on_client_connected")
         async def connected(_transport: SmallWebRTCTransport, _client: Any) -> None:
             await self.session.start()
@@ -295,6 +301,9 @@ class LiveSession:
         try:
             await self.runner.add_workers(self.worker)
             await self.runner.run()
+        except Exception:
+            self.session.pipeline_error(processor="PipelineWorker", category="unexpected_failure")
+            raise
         finally:
             await self.session.close()
 

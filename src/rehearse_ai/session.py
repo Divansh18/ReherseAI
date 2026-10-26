@@ -4,6 +4,7 @@ import asyncio
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from enum import Enum, auto
 from typing import Any
 
 from rehearse_ai.interview import (
@@ -49,22 +50,48 @@ _WITHDRAW_CLAUSE = re.compile(
     r"(?:\s+(?:further|anymore|now|with (?:this|the) (?:interview|session|practice)))?",
     re.I,
 )
-_READY = re.compile(
+
+
+class Readiness(Enum):
+    READY = auto()
+    DEFERRED = auto()
+    UNCLEAR = auto()
+
+
+_DEFER_READINESS = re.compile(
+    r"\b(?:not (?:ready|yet|now)|do not (?:start|begin)|do not want to"
+    r"|give me (?:a |one )?(?:moment|minute|second)|need (?:a |one )?(?:moment|minute|second)"
+    r"|hold on|wait|maybe later|not quite|later)\b"
+)
+_AFFIRM_READINESS = re.compile(
+    r"\b(?:i am ready(?: to (?:start|begin|go))?|i am good to go"
+    r"|let us (?:get|go) into it|let us (?:start|begin|go|do it)"
+    r"|we can (?:start|begin)|go ahead|ready to (?:start|begin|go))"
+    r"(?: now| please)?$"
+)
+_BARE_AFFIRM_READINESS = re.compile(
     r"(?:yes|yeah|yep|sure|okay|ok|absolutely|of course|sounds good|ready"
-    r"|i(?: am|'m) ready(?: to (?:start|begin|go))?|i(?: am|'m) good to go"
-    r"|let'?s (?:start|begin|go|do it)|we can (?:start|begin)|go ahead)"
-    r"(?: i(?: am|'m) ready| let'?s (?:start|begin|go|do it))?",
-    re.I,
+    r"|start|begin|let us go|let us do it)(?: now| please)?"
 )
-_NOT_READY = re.compile(
-    r"\b(?:not yet|not ready|don't want to (?:start|begin)|do not want to (?:start|begin))\b",
-    re.I,
-)
+_FINAL_START = re.compile(r"\b(?:start|begin)(?: now| please)?$")
 
 
-def _is_ready(text: str) -> bool:
-    normalized = " ".join(re.sub(r"[,!?;:.]", " ", text.replace("’", "'")).split())
-    return not _NOT_READY.search(normalized) and bool(_READY.fullmatch(normalized))
+def _classify_readiness(text: str) -> Readiness:
+    normalized = text.lower().replace("’", "'")
+    for old, new in {"i'm": "i am", "let's": "let us", "don't": "do not"}.items():
+        normalized = normalized.replace(old, new)
+    words = re.findall(r"[a-z]+", normalized)
+    words = [word for index, word in enumerate(words) if index == 0 or word != words[index - 1]]
+    normalized = " ".join(words)
+    if _DEFER_READINESS.search(normalized):
+        return Readiness.DEFERRED
+    if (
+        _AFFIRM_READINESS.search(normalized)
+        or _BARE_AFFIRM_READINESS.fullmatch(normalized)
+        or _FINAL_START.search(normalized)
+    ):
+        return Readiness.READY
+    return Readiness.UNCLEAR
 
 
 def _is_stop_request(text: str) -> bool:
@@ -190,7 +217,16 @@ class InterviewSession:
         self._record(
             "tts_requested", speaker=None, utterance_id=utterance.id, generation=self._generation
         )
-        await self._speak(utterance)
+        try:
+            await self._speak(utterance)
+        except Exception as exc:
+            self._record(
+                "response_error",
+                speaker=None,
+                error_type=type(exc).__name__,
+                failure_stage="speech_queue",
+                utterance_id=utterance.id,
+            )
 
     async def user_started(self) -> None:
         if self._closed or self.controller.stage in {Stage.COMPLETE, Stage.ENDED_EARLY}:
@@ -387,13 +423,18 @@ class InterviewSession:
             UtteranceKind.GREETING,
             UtteranceKind.READINESS,
             UtteranceKind.OPENING_WAIT,
+            UtteranceKind.OPENING_CLARIFICATION,
         }
         if interrupted is not None and interrupted.kind in opening_kinds:
             if not answer or _REPEAT.fullmatch(answer):
                 await self._queue_speech(self.controller.retry_interrupted())
                 return True
             if (
-                interrupted.kind is not UtteranceKind.OPENING_WAIT
+                interrupted.kind
+                not in {
+                    UtteranceKind.OPENING_WAIT,
+                    UtteranceKind.OPENING_CLARIFICATION,
+                }
                 and self._interrupted_output_id != interrupted.id
             ):
                 self._record(
@@ -430,6 +471,7 @@ class InterviewSession:
                     await self._queue_speech(self.controller.request_opening_repeat())
                 except LimitReached:
                     self._record("opening_repeat_limit", speaker=None, opening_phase="greeting")
+                    self._start_response()
                 return True
             if answer and interrupted is None:
                 self.controller.add_greeting_continuation(answer)
@@ -443,11 +485,27 @@ class InterviewSession:
                 except LimitReached:
                     self._record("opening_repeat_limit", speaker=None, opening_phase="readiness")
                 return True
-            ready = _is_ready(answer)
-            self._record("readiness_response", speaker="candidate", ready=ready)
-            utterance = self.controller.submit_readiness(ready)
+            classification = _classify_readiness(answer)
+            self._record(
+                "readiness_response",
+                speaker="candidate",
+                classification=classification.name.lower(),
+                ready=classification is Readiness.READY,
+            )
+            utterance = (
+                self.controller.clarify_readiness()
+                if classification is Readiness.UNCLEAR
+                else self.controller.submit_readiness(classification is Readiness.READY)
+            )
             if utterance is not None:
                 await self._queue_speech(utterance)
+            else:
+                self._record(
+                    "opening_waiting_for_readiness",
+                    speaker=None,
+                    classification=classification.name.lower(),
+                    guidance="Say start when ready, not yet to wait, or end the interview to stop.",
+                )
             return True
 
         return False
@@ -539,7 +597,11 @@ class InterviewSession:
                 acknowledgement = result.get("text")
                 if not isinstance(acknowledgement, str):
                     raise ValueError("Opening response did not contain text")
-                utterance = self.controller.prepare_readiness(acknowledgement)
+                try:
+                    utterance = self.controller.prepare_readiness(acknowledgement)
+                except ValueError:
+                    self._record("opening_ack_fallback", speaker=None, error_type="InvalidText")
+                    utterance = self.controller.prepare_readiness("Thanks for sharing.")
                 self._record(
                     "inference_completed",
                     speaker=None,
@@ -668,6 +730,12 @@ class InterviewSession:
                 and generation == self._generation
             ):
                 self._record("opening_ack_fallback", speaker=None, error_type=type(exc).__name__)
+                self._record(
+                    "response_error",
+                    speaker=None,
+                    error_type=type(exc).__name__,
+                    failure_stage="opening_inference",
+                )
                 await self._queue_speech(self.controller.prepare_readiness("Thanks for sharing."))
             else:
                 self._record("response_error", speaker=None, error_type=type(exc).__name__)
@@ -686,6 +754,17 @@ class InterviewSession:
         self._record(
             "tts_started", speaker=None, utterance_id=utterance_id, tts_context_id=context_id
         )
+
+    def pipeline_error(self, *, processor: str | None, category: str | None) -> None:
+        if not self._closed:
+            self._record(
+                "response_error",
+                speaker=None,
+                failure_stage="pipeline",
+                processor=processor,
+                category=category,
+                utterance_id=self.controller.pending.id if self.controller.pending else None,
+            )
 
     def tts_first_audio(self, context_id: str | None) -> None:
         utterance_id = self._tts_contexts.get(context_id or "")

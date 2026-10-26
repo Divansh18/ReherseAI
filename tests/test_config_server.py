@@ -1,5 +1,9 @@
+import asyncio
+import json
+
 import pytest
 from fastapi.testclient import TestClient
+from pipecat.frames.frames import ErrorFrame
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 
 from rehearse_ai.config import ConfigurationError, Settings
@@ -79,5 +83,23 @@ async def test_tts_one_does_not_receive_unsupported_style_instructions(tmp_path)
     live = LiveSession(connection, settings)
     tts = next(p for p in live.pipeline.processors if type(p).__name__ == "OpenAITTSService")
     assert tts._settings.instructions is None
+    await live.stop()
+    await connection.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_provider_error_reaches_session_log(tmp_path):
+    settings = Settings(deepgram_api_key="test-dg", openai_api_key="test-oa", session_dir=tmp_path)
+    connection = SmallWebRTCConnection()
+    live = LiveSession(connection, settings)
+    tts = next(p for p in live.pipeline.processors if type(p).__name__ == "OpenAITTSService")
+    await live.worker._call_event_handler(
+        "on_pipeline_error", ErrorFrame(error="synthetic TTS failure", processor=tts)
+    )
+    await asyncio.sleep(0)
+    events = [json.loads(line) for line in live.log.path.read_text().splitlines()]
+    assert events[-1]["event"] == "response_error"
+    assert events[-1]["failure_stage"] == "pipeline"
+    assert events[-1]["processor"] == "OpenAITTSService"
     await live.stop()
     await connection.disconnect()

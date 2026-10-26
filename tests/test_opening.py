@@ -12,6 +12,7 @@ from pipecat.processors.frame_processor import FrameDirection
 from rehearse_ai.interview import (
     GREETING,
     QUESTIONS,
+    READINESS_CLARIFICATION,
     READINESS_PROMPT,
     InterviewController,
     InvalidTransition,
@@ -146,6 +147,138 @@ async def test_greeting_ack_not_yet_repeat_then_ready_through_session_route(tmp_
         False,
         True,
     ]
+    assert any(
+        row["event"] == "opening_waiting_for_readiness" and row["classification"] == "deferred"
+        for row in rows
+    )
+    await session.close()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "Yes. Let's let's go into it.",
+        "Let's get into it.",
+        "Start.",
+        "I'm ready.",
+        "Go ahead.",
+    ],
+)
+@pytest.mark.asyncio
+async def test_natural_affirmative_readiness_routes_to_question_one(tmp_path, response):
+    session, adapter, spoken, log = harness(tmp_path)
+    await session.start()
+    deliver(session)
+    await turn(adapter, "I'm doing great. How are you?")
+    await settle()
+    deliver(session)
+    await turn(adapter, response)
+    assert spoken[-1].text == QUESTIONS[0]
+    assert spoken[-1].kind is UtteranceKind.QUESTION
+    assert session.controller.current_question_number is None
+    assert session.controller.answers == ((), (), (), ())
+    rows = [json.loads(line) for line in log.path.read_text().splitlines()]
+    assert [row["classification"] for row in rows if row["event"] == "readiness_response"] == [
+        "ready"
+    ]
+    await session.close()
+
+
+@pytest.mark.parametrize(
+    "response", ["I'm not ready yet.", "Don't start.", "Yes, but give me a moment."]
+)
+@pytest.mark.asyncio
+async def test_deferred_readiness_does_not_start_question_one(tmp_path, response):
+    session, adapter, spoken, log = harness(tmp_path)
+    await session.start()
+    deliver(session)
+    await turn(adapter, "Doing fine.")
+    await settle()
+    deliver(session)
+    await turn(adapter, response)
+    assert spoken[-1].kind is UtteranceKind.OPENING_WAIT
+    assert session.controller.current_question_number is None
+    rows = [json.loads(line) for line in log.path.read_text().splitlines()]
+    assert [row["classification"] for row in rows if row["event"] == "readiness_response"] == [
+        "deferred"
+    ]
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_real_log_sequence_and_segmented_start_recovery(tmp_path):
+    session, adapter, spoken, _log = harness(tmp_path)
+    await session.start()
+    deliver(session)
+    await turn(adapter, "I'm doing great. How are you?")
+    await settle()
+    deliver(session)
+    await turn(adapter, "Yes. Let's let's go into it.")
+    assert spoken[-1].text == QUESTIONS[0]
+    await session.close()
+
+    recovered, adapter, spoken, log = harness(tmp_path / "recovery")
+    await recovered.start()
+    deliver(recovered)
+    await turn(adapter, "I'm doing great. How are you?")
+    await settle()
+    deliver(recovered)
+    await turn(adapter, "Not yet.")
+    deliver(recovered)
+    await turn(adapter, "I'm saying let's get into it.", "Start.")
+    assert spoken[-1].text == QUESTIONS[0]
+    rows = [json.loads(line) for line in log.path.read_text().splitlines()]
+    assert [row["text"] for row in rows if row["event"] == "stt_final_segment"][-2:] == [
+        "I'm saying let's get into it.",
+        "Start.",
+    ]
+    assert [row["classification"] for row in rows if row["event"] == "readiness_response"] == [
+        "deferred",
+        "ready",
+    ]
+    await recovered.close()
+
+
+@pytest.mark.asyncio
+async def test_unclear_opening_and_exhausted_allowances_remain_actionable(tmp_path):
+    published = []
+    session, adapter, spoken, log = harness(tmp_path)
+    session._publish = published.append
+    await session.start()
+    deliver(session)
+    await turn(adapter, "I'm fine.")
+    await settle()
+    deliver(session)
+    await turn(adapter, "Hey. Where you are?")
+    assert spoken[-1].text == READINESS_CLARIFICATION
+    deliver(session)
+    count = len(spoken)
+    await turn(adapter, "Hello. What's up?")
+    assert len(spoken) == count
+    assert published[-1]["event"]["event"] == "opening_waiting_for_readiness"
+    await turn(adapter, "Can you repeat that?")
+    assert spoken[-1].text == READINESS_PROMPT
+    deliver(session)
+    await turn(adapter, "Can you repeat that?")
+    assert published[-1]["event"]["event"] == "opening_repeat_limit"
+    assert session.controller.stage is Stage.AWAITING_READINESS
+    count = len(spoken)
+    await turn(adapter, "I'm not ready yet.")
+    assert spoken[-1].kind is UtteranceKind.OPENING_WAIT
+    deliver(session)
+    await turn(adapter, "Don't start.")
+    assert len(spoken) == count + 1
+    assert published[-1]["event"]["event"] == "opening_waiting_for_readiness"
+    await turn(adapter, "Start.")
+    assert spoken[-1].text == QUESTIONS[0]
+    rows = [json.loads(line) for line in log.path.read_text().splitlines()]
+    assert [row["classification"] for row in rows if row["event"] == "readiness_response"] == [
+        "unclear",
+        "unclear",
+        "deferred",
+        "deferred",
+        "ready",
+    ]
     await session.close()
 
 
@@ -196,6 +329,88 @@ async def test_repeat_during_opening_ack_cancels_inference_and_reasks_greeting(t
     assert spoken[-1].text == GREETING
     assert session.controller.greeting_response == ""
     assert session.controller.answers == ((), (), (), ())
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_greeting_repeat_resumes_cancelled_ack_generation(tmp_path):
+    started = asyncio.Event()
+    cancelled = []
+    calls = 0
+
+    async def infer(kind, _payload):
+        nonlocal calls
+        assert kind == "opening_ack"
+        calls += 1
+        if calls == 1:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+        return {"text": "Good to hear."}
+
+    session, adapter, spoken, log = harness(tmp_path, infer)
+    await session.start()
+    deliver(session)
+    await turn(adapter, "Can you repeat that?")
+    deliver(session)
+    await turn(adapter, "Doing well.")
+    await started.wait()
+    await turn(adapter, "Can you repeat that?")
+    await settle()
+    assert cancelled
+    assert calls == 2
+    assert spoken[-1].kind is UtteranceKind.READINESS
+    assert any(
+        json.loads(line)["event"] == "opening_repeat_limit"
+        for line in log.path.read_text().splitlines()
+    )
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_queue_and_pipeline_failures_are_published(tmp_path):
+    published = []
+
+    async def broken_speak(_utterance):
+        raise RuntimeError("synthetic transport failure")
+
+    session = InterviewSession(
+        SessionLog(tmp_path, "errors"),
+        lambda *_args: asyncio.sleep(0),
+        broken_speak,
+        published.append,
+    )
+    await session.start()
+    session.pipeline_error(processor="OpenAITTSService", category="provider_error")
+    errors = [
+        message["event"] for message in published if message["event"]["event"] == "response_error"
+    ]
+    assert [error["failure_stage"] for error in errors] == ["speech_queue", "pipeline"]
+    assert errors[0]["utterance_id"] == session.controller.pending.id
+    assert errors[1]["processor"] == "OpenAITTSService"
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_opening_inference_failure_reports_error_and_uses_safe_ack(tmp_path):
+    async def infer(_kind, _payload):
+        raise RuntimeError("synthetic provider failure")
+
+    session, adapter, spoken, log = harness(tmp_path, infer)
+    await session.start()
+    deliver(session)
+    await turn(adapter, "I'm doing well.")
+    await settle()
+    assert spoken[-1].kind is UtteranceKind.READINESS
+    assert spoken[-1].text.startswith("Thanks for sharing.")
+    rows = [json.loads(line) for line in log.path.read_text().splitlines()]
+    assert any(
+        row["event"] == "response_error" and row["failure_stage"] == "opening_inference"
+        for row in rows
+    )
     await session.close()
 
 
