@@ -43,6 +43,8 @@ The new event stream uses one server monotonic clock in milliseconds from sessio
 
 ## Open decisions and verification
 
+- Restart the server that is still listening on port 7860 before the next microphone session. The newest log lacks fields added in `7c6647d`, showing that the session used an older code load. Retest “Can I end this interview?” and “Want you to end the interview. Right now.”; require `early_end_requested`, no later question utterance, and a short early closing. The new stop routing is covered by mocked STT-frame tests only.
+- Retest the structured-risk-report answer for a specific missing-detail follow-up or advancement. The new payload joins all current-question turns and the prompt forbids repeating details already supplied, but the actual LLM behavior is not established by mocked decisions.
 - Repeat the actual follow-up interruption, question-two pre-audio interruption, spoken end request, and “So the idea…” pause with the new code. Compare VAD stop, STT segment, turn completion, inference, first TTS audio, and output timestamps in the new log. A 0.9–1.2 second pause range is an initial tuning experiment, not a guaranteed solution.
 - Measure first TTS audio separately from output start in a real session. The earlier log shows preparation-to-output gaps of several seconds but cannot assign them to one stage. The structured LLM call remains fully buffered by design; OpenAI TTS emits streaming audio chunks.
 - Check browser playout and cleanup in the next real session; browser per-utterance playback onset is currently unavailable and server delivery still does not prove browser playout.

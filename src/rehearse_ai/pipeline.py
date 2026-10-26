@@ -81,7 +81,11 @@ class InterviewInput(FrameProcessor):
         self._turn_open = False
 
     async def speak(self, utterance: Utterance) -> None:
+        if self.session is None or self.session.controller.pending != utterance:
+            return
         await self.push_frame(UtteranceMarkerFrame(utterance_id=utterance.id))
+        if self.session.controller.pending != utterance:
+            return
         await self.push_frame(TTSSpeakFrame(text=utterance.text, append_to_context=False))
 
     async def cancel_audio(self) -> None:
@@ -94,6 +98,8 @@ class InterviewInput(FrameProcessor):
                 if not self._turn_open:
                     self._turn_open = True
                     await self.session.user_started()
+                    if self._segments:
+                        await self.session.detect_stop_from_segments(" ".join(self._segments))
             elif isinstance(frame, VADUserStartedSpeakingFrame):
                 self.session.turn_signal("vad_started", frame_id=frame.id)
             elif isinstance(frame, VADUserStoppedSpeakingFrame):
@@ -112,6 +118,8 @@ class InterviewInput(FrameProcessor):
                         finalized=frame.finalized,
                         frame_id=frame.id,
                     )
+                    if self._turn_open:
+                        await self.session.detect_stop_from_segments(" ".join(self._segments))
             elif isinstance(frame, UserStoppedSpeakingFrame):
                 if self._turn_open or self._segments:
                     await self.session.user_stopped(

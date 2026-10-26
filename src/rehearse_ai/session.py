@@ -26,15 +26,32 @@ _REPEAT = re.compile(
     re.IGNORECASE,
 )
 _SKIP = re.compile(r"^(?:please\s+)?(?:skip(?: this question)?|next question)\??[.!]?$", re.I)
-_END = re.compile(
-    r"(?:^|[.!?]\s*)(?:but\s+)?"
-    r"(?:(?:can|could|may)\s+we\s+|i\s+(?:want|would like|need)\s+to\s+|"
-    r"i'd\s+like\s+to\s+|let's\s+|please\s+)?"
+_END_CLAUSE = re.compile(
+    r"(?:please\s+)?(?:"
+    r"(?:can|could|may|would)\s+(?:i|we|you)\s+"
+    r"|(?:i|we)\s+(?:want|would like|need)\s+(?:you\s+)?to\s+"
+    r"|(?:i'd|we'd)\s+like\s+to\s+"
+    r"|want\s+you\s+to\s+"
+    r"|let's\s+"
+    r")?"
     r"(?:end|stop|finish|quit|exit|wrap up)"
-    r"(?:\s+(?:(?:the|this|our)\s+)?(?:interview|session|practice)|\s+(?:now|here|it))?"
-    r"[?.!]*$|\b(?:i'm|i am|we're|we are)\s+(?:done|finished)[?.!]*$",
+    r"(?:\s+(?:(?:the|this|our)\s+)?(?:interview|session|practice)"
+    r"|\s+(?:now|here|it))?"
+    r"(?:\s+right\s+now|\s+please)?",
     re.I,
 )
+_DONE_CLAUSE = re.compile(r"(?:i'm|i am|we're|we are)\s+(?:done|finished)", re.I)
+
+
+def _is_stop_request(text: str) -> bool:
+    """Match a complete, affirmative request clause, including STT sentence splits."""
+    normalized = text.replace("’", "'")
+    for sentence in re.split(r"[.!?]+", normalized):
+        for clause in re.split(r"\bbut\b", sentence, flags=re.I):
+            clause = " ".join(re.sub(r"[,;:]", " ", clause).split())
+            if _END_CLAUSE.fullmatch(clause) or _DONE_CLAUSE.fullmatch(clause):
+                return True
+    return False
 
 
 class InterviewSession:
@@ -97,6 +114,18 @@ class InterviewSession:
                 finalized=finalized,
                 frame_id=frame_id,
             )
+
+    async def detect_stop_from_segments(self, text: str) -> bool:
+        if self._closed or self.controller.stage in {
+            Stage.COMPLETE,
+            Stage.ENDED_EARLY,
+            Stage.EARLY_CLOSING,
+        }:
+            return False
+        if not _is_stop_request(text):
+            return False
+        await self._end_early(text, defer_closing=True)
+        return True
 
     async def start(self) -> None:
         if self._closed or self.controller.stage is not Stage.NEW:
@@ -216,7 +245,7 @@ class InterviewSession:
         )
         self._turn_started_at = None
 
-        if _END.search(answer) and self.controller.stage is not Stage.EARLY_CLOSING:
+        if _is_stop_request(answer) and self.controller.stage is not Stage.EARLY_CLOSING:
             await self._end_early(answer)
             return
         if self.controller.stage is Stage.EARLY_CLOSING:
@@ -300,7 +329,7 @@ class InterviewSession:
 
         self._start_response()
 
-    async def _end_early(self, request: str) -> None:
+    async def _end_early(self, request: str, *, defer_closing: bool = False) -> None:
         self._generation += 1
         task = self._response_task
         if task and not task.done():
@@ -314,6 +343,7 @@ class InterviewSession:
                 speaker="candidate",
                 text=request,
                 utterance_id=pending.id if pending else None,
+                detection_source="final_stt_segments" if defer_closing else "completed_turn",
             )
             if pending:
                 self._record(
@@ -322,8 +352,13 @@ class InterviewSession:
                     utterance_id=pending.id,
                     cancellation_reason="early_end",
                 )
-            if self._cancel_audio:
+            # Pipecat already broadcasts interruption on UserStartedSpeakingFrame.
+            # A second broadcast while processing an STT frame could reset the
+            # queue before UserStoppedSpeakingFrame reaches this adapter.
+            if self._cancel_audio and not defer_closing:
                 await self._cancel_audio()
+            if defer_closing:
+                return
             if any(self.controller.answers):
                 self._start_response()
             else:
@@ -338,11 +373,13 @@ class InterviewSession:
 
     def _payload(self) -> dict[str, Any]:
         index = self.controller.current_question_number
+        current_answers = list(self.controller.answers[index - 1]) if index else []
         return {
             "current_question_number": self.controller.current_question_number,
             "current_question": self.controller.current_question,
             "answers_by_question": [list(turns) for turns in self.controller.answers],
-            "current_question_answers": list(self.controller.answers[index - 1]) if index else [],
+            "current_question_answers": current_answers,
+            "current_question_answer": " ".join(current_answers),
             "last_delivered_prompt": (
                 self._last_delivered_prompt.text if self._last_delivered_prompt else None
             ),
