@@ -439,6 +439,16 @@ class InterviewController:
         )
         return self._prepare(UtteranceKind.REPEAT, text, index)
 
+    def explain_current_question(self, text: str) -> Utterance:
+        """Answer an explicit request to clarify the question without a project probe."""
+        if self._stage not in {Stage.AWAITING_ANSWER, Stage.AWAITING_PROPOSAL}:
+            raise InvalidTransition("There is no project question to explain")
+        index = self._question_index
+        if self._clarifications[index] >= MAX_CLARIFICATIONS_PER_QUESTION:
+            raise LimitReached("Question explanation limit reached")
+        self._clarifications[index] += 1
+        return self._prepare(UtteranceKind.CLARIFICATION, text, index)
+
     def set_project_status(self, status: str) -> None:
         if status == "technical_example":
             self._project_established = True
@@ -510,20 +520,19 @@ class InterviewController:
                 return None
             return self._prepare(UtteranceKind.QUESTION, QUESTIONS[index + 1], index + 1)
 
+        if kind not in {ReplyKind.FOLLOW_UP, ReplyKind.NUDGE, ReplyKind.CLARIFICATION}:
+            raise ValueError("Unsupported project proposal")
+
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Spoken proposal text must be nonempty")
-        if kind is ReplyKind.CLARIFICATION:
-            if self._clarifications[index] >= MAX_CLARIFICATIONS_PER_QUESTION:
-                raise LimitReached("Clarification limit reached for this question")
-            self._clarifications[index] += 1
-            utterance_kind = UtteranceKind.CLARIFICATION
-        else:
-            if self._follow_ups[index] >= MAX_FOLLOW_UPS_PER_QUESTION:
-                raise LimitReached("Follow-up limit reached for this question")
-            self._follow_ups[index] += 1
-            utterance_kind = (
-                UtteranceKind.FOLLOW_UP if kind is ReplyKind.FOLLOW_UP else UtteranceKind.NUDGE
-            )
+        if self._follow_ups[index] >= MAX_FOLLOW_UPS_PER_QUESTION:
+            raise LimitReached("Extra project prompt limit reached for this question")
+        self._follow_ups[index] += 1
+        utterance_kind = {
+            ReplyKind.FOLLOW_UP: UtteranceKind.FOLLOW_UP,
+            ReplyKind.NUDGE: UtteranceKind.NUDGE,
+            ReplyKind.CLARIFICATION: UtteranceKind.CLARIFICATION,
+        }[kind]
         return self._prepare(utterance_kind, text.strip(), index)
 
     def prepare_feedback(self, text: str) -> Utterance:

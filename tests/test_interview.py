@@ -78,7 +78,7 @@ def test_follow_up_and_nudge_share_one_slot() -> None:
     assert controller.current_question_number == 1
 
 
-def test_clarification_and_repeat_share_one_slot() -> None:
+def test_model_clarification_spends_project_probe_not_candidate_repeat_slot() -> None:
     controller = InterviewController()
     start_and_answer(controller)
     clarification = controller.propose(ReplyKind.CLARIFICATION, "Which part did you own?")
@@ -94,8 +94,25 @@ def test_clarification_and_repeat_share_one_slot() -> None:
     assert repeated.text == QUESTIONS[0]
     deliver(another, repeated)
     another.submit_answer("I owned the design")
+    clarification = another.propose(ReplyKind.CLARIFICATION, "Which part?")
+    assert clarification.kind is UtteranceKind.CLARIFICATION
+    assert another.remaining_follow_ups == 0
+    assert another.remaining_clarifications == 0
+
+
+def test_follow_up_cannot_be_relabelled_as_model_clarification() -> None:
+    controller = InterviewController()
+    start_and_answer(controller, "I built a parser")
+    follow_up = controller.propose(ReplyKind.FOLLOW_UP, "What did it parse?")
+    deliver(controller, follow_up)
+    controller.submit_answer("Source files")
     with pytest.raises(LimitReached):
-        another.propose(ReplyKind.CLARIFICATION, "Which part?")
+        controller.propose(ReplyKind.CLARIFICATION, "Which source files?")
+    assert controller.remaining_follow_ups == 0
+    assert controller.remaining_clarifications == 1
+    explanation = controller.explain_current_question("I meant the parser you described.")
+    assert explanation.kind is UtteranceKind.CLARIFICATION
+    assert controller.remaining_clarifications == 0
 
 
 def test_empty_answer_and_repeat_request_are_bounded() -> None:

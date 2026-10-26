@@ -285,3 +285,159 @@ async def test_tts_no_audio_error_is_correlated_and_not_mistaken_for_delivery(tm
         event["event"] == "agent_delivery_reported" and event["utterance_id"] == first.id
         for event in events
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_action", ["clarification", "wait", "advance"])
+async def test_latest_session_project_probes_are_bounded_and_question_four_closes(
+    tmp_path, final_action
+):
+    calls = []
+
+    async def infer(kind, payload):
+        calls.append((kind, payload))
+        if kind == "opening_ack":
+            return {"text": "Thanks for sharing."}
+        if kind == "feedback":
+            assert payload["answers_by_question"][3] == [
+                "Think I'll add a backup model.",
+                "Because of the fact that backup model will be more good.",
+            ]
+            return {
+                "lines": [
+                    "You identified webhook event handling as a concrete challenge.",
+                    "Next time, describe how you checked that Great Pair worked well.",
+                ]
+            }
+        number = payload["current_question_number"]
+        answer = payload["current_question_answer"]
+        if number == 1 and "Great Pair" in answer and "booking" not in answer:
+            return {
+                "action": "follow_up",
+                "text": "What does Great Pair do?",
+                "project_status": "technical_example",
+            }
+        if number == 1:
+            return {
+                "action": "clarification",
+                "text": "What do you mean by booking?",
+                "project_status": "technical_example",
+            }
+        if number == 2:
+            return {"action": "advance", "text": "", "project_status": "unclear"}
+        if number == 3 and len(payload["current_question_answers"]) == 1:
+            return {
+                "action": "follow_up",
+                "text": "What example showed it worked?",
+                "project_status": "unclear",
+            }
+        if number == 3:
+            return {
+                "action": "clarification",
+                "text": "Could you share an example or metric?",
+                "project_status": "unclear",
+            }
+        if len(payload["current_question_answers"]) == 1:
+            return {
+                "action": "follow_up",
+                "text": "How would a backup model help?",
+                "project_status": "unclear",
+            }
+        return {
+            "action": final_action,
+            "text": "Could you clarify how it helps?" if final_action == "clarification" else "",
+            "project_status": "unclear",
+        }
+
+    session, adapter, spoken, _, log = harness(tmp_path, infer)
+    await question_one(session, adapter)
+    await turn(adapter, "I built Great Pair.")
+    await settle()
+    assert spoken[-1].kind is UtteranceKind.FOLLOW_UP
+    deliver(session)
+    await turn(adapter, "So I've been booking on it full time, and finished development.")
+    await settle()
+    assert spoken[-1].text == QUESTIONS[1]
+    assert "booking" in session.controller.answers[0][-1]
+    deliver(session)
+    await turn(adapter, "The hardest technical problem was catching webhook events.")
+    await settle()
+    assert spoken[-1].text == QUESTIONS[2]
+    deliver(session)
+    await turn(adapter, "I checked it myself and thought it worked well.")
+    await settle()
+    assert spoken[-1].kind is UtteranceKind.FOLLOW_UP
+    deliver(session)
+    await turn(adapter, "I checked it myself again.")
+    await settle()
+    assert spoken[-1].text == QUESTIONS[3]
+    deliver(session)
+    count = len([kind for kind, _ in calls if kind == "decision"])
+    await turn(adapter, "Definitely now on what?")
+    assert spoken[-1].text == (
+        "In the project you described—what would you change if you built it again?"
+    )
+    assert len([kind for kind, _ in calls if kind == "decision"]) == count
+    assert session.controller.answers[3] == ()
+    deliver(session)
+    await turn(adapter, "Think I'll add a backup model.")
+    await settle()
+    assert spoken[-1].kind is UtteranceKind.FOLLOW_UP
+    deliver(session)
+    await turn(adapter, "Because of the fact that backup model will be")
+    await settle()
+    assert session.controller.stage is Stage.AWAITING_PROPOSAL
+    await turn(adapter, "more good.")
+    await settle()
+    assert spoken[-1].kind is UtteranceKind.FEEDBACK
+    assert (
+        len(
+            [
+                item
+                for item in spoken
+                if item.kind is UtteranceKind.FOLLOW_UP and item.question_number == 4
+            ]
+        )
+        == 1
+    )
+    deliver(session)
+    assert session.controller.stage is Stage.COMPLETE
+    await session.close()
+    events = [json.loads(line) for line in log.path.read_text().splitlines()]
+    assert len(
+        [
+            event
+            for event in events
+            if event["event"] == "proposal_rejected"
+            and event.get("reason") == "project_probe_limit"
+        ]
+    ) >= (3 if final_action == "clarification" else 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response", ["I don't know.", "No. I don't wanna clarify.", "I don't have a metric."]
+)
+async def test_question_three_accepts_unknown_evidence_without_another_probe(tmp_path, response):
+    async def infer(kind, payload):
+        if kind == "opening_ack":
+            return {"text": "Thanks for sharing."}
+        if payload["current_question_number"] == 3:
+            return {"action": "follow_up", "text": "What metric did you use?"}
+        return {"action": "advance", "text": "", "project_status": "technical_example"}
+
+    session, adapter, spoken, _, _ = harness(tmp_path, infer)
+    await question_one(session, adapter)
+    for answer in ("I built a parser.", "The hardest part was tokenization."):
+        await turn(adapter, answer)
+        await settle()
+        deliver(session)
+    await turn(adapter, "I checked it myself.")
+    await settle()
+    assert spoken[-1].kind is UtteranceKind.FOLLOW_UP
+    deliver(session)
+    await turn(adapter, response)
+    await settle()
+    assert spoken[-1].text == QUESTIONS[3]
+    assert session.controller.answers[2][-1] == response
+    await session.close()

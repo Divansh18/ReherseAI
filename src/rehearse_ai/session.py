@@ -147,6 +147,40 @@ def _asks_about_name(text: str) -> bool:
     )
 
 
+def _asks_for_question_scope(text: str) -> bool:
+    """Recognize a short request for the subject of the active question."""
+    normalized = re.sub(r"[^a-z ]", " ", text.lower())
+    normalized = " ".join(normalized.split())
+    return bool(
+        re.search(r"\b(?:on|about) what\b|\bwhat do you mean\b", normalized)
+        and len(normalized.split()) <= 9
+    )
+
+
+def _declines_detail(text: str) -> bool:
+    """Accept a clear inability or refusal without demanding another example."""
+    normalized = " ".join(text.lower().replace("’", "'").split()).strip(" .!?")
+    normalized = re.sub(r"^(?:no|sorry)[.!?, ]+", "", normalized)
+    return bool(
+        re.fullmatch(
+            r"(?:i |we )?(?:don't|do not) know(?: (?:that|how|any|of one))?"
+            r"|(?:i |we )?(?:can't|cannot) (?:remember|recall|say)"
+            r"|(?:i |we )?(?:don't|do not) (?:want to|wanna) (?:answer|clarify|share|say)"
+            r"|(?:i |we )?(?:don't|do not) have (?:a |any )?(?:metric|example|number|data)"
+            r"|(?:i'd|i would|we'd|we would) rather not(?: answer| say)?",
+            normalized,
+        )
+    )
+
+
+def _looks_unfinished(text: str) -> bool:
+    """Conservatively retain a turn ending in an unfinished clause."""
+    normalized = text.lower().strip().rstrip(".,!? ")
+    return bool(
+        re.search(r"\b(?:the idea|will be|because|that|and|but|so|to|of|with)$", normalized)
+    )
+
+
 def _is_sentence_request(pattern: re.Pattern[str], text: str) -> bool:
     """Recognize a whole control clause even after a separate preamble."""
     return any(pattern.fullmatch(clause.strip()) for clause in re.split(r"(?<=[.!?])\s+", text))
@@ -459,6 +493,22 @@ class InterviewSession:
             return
 
         if await self._route_opening(answer):
+            return
+
+        if (
+            self.controller.current_question_number == 4
+            and self.controller.stage in {Stage.AWAITING_ANSWER, Stage.AWAITING_PROPOSAL}
+            and _asks_for_question_scope(answer)
+        ):
+            try:
+                explanation = self.controller.explain_current_question(
+                    "In the project you described—what would you change if you built it again?"
+                )
+            except LimitReached:
+                self._record("clarification_limit", speaker=None)
+                return
+            self._record("question_scope_requested", speaker="candidate", text=answer)
+            await self._queue_speech(explanation)
             return
 
         interrupted = self.controller.interrupted_utterance
@@ -891,7 +941,10 @@ class InterviewSession:
                 else None
             ),
             "closing_remarks": list(self.controller.closing_remarks),
-            "max_extra_prompts_per_question": {"follow_up_or_nudge": 1, "clarification": 1},
+            "max_extra_prompts_per_question": {
+                "llm_project_probe_including_clarification": 1,
+                "candidate_requested_repeat_or_explanation": 1,
+            },
             "remaining_follow_ups": self.controller.remaining_follow_ups,
             "remaining_clarifications": self.controller.remaining_clarifications,
             "remaining_detours": self.controller.remaining_detours,
@@ -1068,6 +1121,19 @@ class InterviewSession:
                 return
 
             if not self._stop_latched and self.controller.stage is Stage.AWAITING_PROPOSAL:
+                if (
+                    self.controller.current_question_number > 1
+                    or self.controller.project_established is True
+                ) and _declines_detail(self._latest_candidate_turn):
+                    self._record(
+                        "candidate_declined_detail", speaker="candidate", generation=generation
+                    )
+                    utterance = self.controller.propose(ReplyKind.ADVANCE)
+                    if utterance is not None:
+                        await self._queue_speech(utterance)
+                    else:
+                        self._start_response()
+                    return
                 started_at = time.perf_counter()
                 self._record(
                     "inference_started",
@@ -1105,6 +1171,28 @@ class InterviewSession:
                     remaining_clarifications=self.controller.remaining_clarifications,
                     validated=True,
                 )
+                if self.controller.remaining_follow_ups == 0:
+                    if action in {"FOLLOW_UP", "NUDGE", "CLARIFICATION"}:
+                        self._record(
+                            "proposal_rejected",
+                            speaker=None,
+                            reason="project_probe_limit",
+                            action=action.lower(),
+                        )
+                    if _looks_unfinished(self._latest_candidate_turn) and action != "DETOUR":
+                        action = "WAIT"
+                        text = ""
+                    elif action in {"FOLLOW_UP", "NUDGE", "CLARIFICATION", "WAIT"} or (
+                        action == "DETOUR" and "?" not in self._latest_candidate_turn
+                    ):
+                        self._record(
+                            "decision_overridden",
+                            speaker=None,
+                            reason="completed_answer_after_project_probe",
+                            proposed_action=action.lower(),
+                        )
+                        action = "ADVANCE"
+                        text = ""
                 if self.controller.current_question_number == 1 and action != "DETOUR":
                     if project_status in {
                         "technical_example",
