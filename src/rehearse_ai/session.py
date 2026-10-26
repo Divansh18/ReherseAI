@@ -239,6 +239,9 @@ class InterviewSession:
         self._tts_completed_ids: set[int] = set()
         self._tts_contexts: dict[str, int] = {}
         self._tts_context_history: dict[str, int] = {}
+        self._tts_context_started_at: dict[str, float] = {}
+        self._tts_audio_stats: dict[str, list[int]] = {}
+        self._provider_tts_stats: dict[str, list[float | int]] = {}
         self._first_audio_ids: set[int] = set()
         self._interrupted_output_id: int | None = None
         self._cancelled_output_stop_debt = 0
@@ -1302,8 +1305,74 @@ class InterviewSession:
             return
         self._tts_contexts[context_id] = utterance_id
         self._tts_context_history[context_id] = utterance_id
+        self._tts_context_started_at[context_id] = time.perf_counter()
+        self._tts_audio_stats[context_id] = [0, 0]
         self._record(
             "tts_started", speaker=None, utterance_id=utterance_id, tts_context_id=context_id
+        )
+
+    def provider_tts_requested(self, context_id: str, text_length: int) -> None:
+        if self._closed:
+            return
+        self._provider_tts_stats[context_id] = [time.perf_counter(), 0, 0]
+        self._record(
+            "provider_tts_requested",
+            speaker=None,
+            tts_context_id=context_id,
+            utterance_id=self._tts_context_history.get(context_id),
+            text_length=text_length,
+        )
+
+    def provider_tts_audio_chunk(self, context_id: str, byte_count: int) -> None:
+        if self._closed or context_id not in self._provider_tts_stats:
+            return
+        stats = self._provider_tts_stats[context_id]
+        stats[1] += 1
+        stats[2] += byte_count
+        if stats[1] == 1:
+            self._record(
+                "provider_first_audio",
+                speaker=None,
+                tts_context_id=context_id,
+                utterance_id=self._tts_context_history.get(context_id),
+                first_audio_ms=round((time.perf_counter() - stats[0]) * 1000, 1),
+                audio_bytes=byte_count,
+            )
+
+    def provider_tts_error(self, context_id: str, error: str, status: int | None) -> None:
+        if self._closed:
+            return
+        match = re.search(r"status:\s*(\d{3})", error)
+        self._record(
+            "provider_tts_error",
+            speaker=None,
+            tts_context_id=context_id,
+            utterance_id=self._tts_context_history.get(context_id),
+            error_type=error if error.isidentifier() else "ErrorFrame",
+            provider_status=status or (int(match.group(1)) if match else None),
+        )
+
+    def provider_tts_cancelled(self, context_id: str) -> None:
+        if not self._closed:
+            self._record(
+                "provider_tts_cancelled",
+                speaker=None,
+                tts_context_id=context_id,
+                utterance_id=self._tts_context_history.get(context_id),
+            )
+
+    def provider_tts_finished(self, context_id: str) -> None:
+        if self._closed or context_id not in self._provider_tts_stats:
+            return
+        started, chunks, byte_count = self._provider_tts_stats.pop(context_id)
+        self._record(
+            "provider_tts_finished",
+            speaker=None,
+            tts_context_id=context_id,
+            utterance_id=self._tts_context_history.get(context_id),
+            duration_ms=round((time.perf_counter() - started) * 1000, 1),
+            audio_chunks=chunks,
+            audio_bytes=byte_count,
         )
 
     def pipeline_error(
@@ -1355,7 +1424,37 @@ class InterviewSession:
             tts_context_id=context_id,
             utterance_id=utterance_id,
             recoverable=bool(match),
+            tts_audio_chunks=self._tts_audio_stats.get(context_id, [0, 0])[0],
+            tts_audio_bytes=self._tts_audio_stats.get(context_id, [0, 0])[1],
+            tts_context_elapsed_ms=(
+                round((time.perf_counter() - self._tts_context_started_at[context_id]) * 1000, 1)
+                if context_id in self._tts_context_started_at
+                else None
+            ),
         )
+
+    def tts_audio_chunk(self, context_id: str | None, byte_count: int) -> bool:
+        if self._closed:
+            return False
+        pending = self.controller.pending
+        if (
+            not context_id
+            or context_id not in self._tts_contexts
+            or pending is None
+            or pending.id != self._tts_contexts[context_id]
+        ):
+            self._record(
+                "stale_tts_audio_discarded",
+                speaker=None,
+                tts_context_id=context_id,
+                audio_bytes=byte_count,
+            )
+            return False
+        stats = self._tts_audio_stats[context_id]
+        stats[0] += 1
+        stats[1] += byte_count
+        self.tts_first_audio(context_id)
+        return True
 
     def tts_first_audio(self, context_id: str | None) -> None:
         utterance_id = self._tts_contexts.get(context_id or "")
@@ -1379,11 +1478,14 @@ class InterviewSession:
         utterance_id = self._tts_contexts.pop(context_id or "", None)
         if utterance_id is not None:
             self._tts_completed_ids.add(utterance_id)
+            stats = self._tts_audio_stats.get(context_id or "", [0, 0])
             self._record(
                 "tts_generation_finished",
                 speaker=None,
                 utterance_id=utterance_id,
                 tts_context_id=context_id,
+                audio_chunks=stats[0],
+                audio_bytes=stats[1],
             )
 
     def bot_started(self) -> None:

@@ -4,6 +4,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 from pipecat.frames.frames import ErrorFrame
+from pipecat.services.openai.tts import OpenAITTSService
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 
 from rehearse_ai.config import ConfigurationError, Settings
@@ -61,12 +62,13 @@ async def test_locked_pipecat_pipeline_assembles_without_provider_calls(tmp_path
     live = LiveSession(connection, settings)
     names = [type(processor).__name__ for processor in live.pipeline.processors]
     assert names.index("DeepgramSTTService") < names.index("InterviewInput")
-    assert names.index("InterviewInput") < names.index("OpenAITTSService")
-    assert names.index("OpenAITTSService") < names.index("DeliveryObserver")
-    tts = next(p for p in live.pipeline.processors if type(p).__name__ == "OpenAITTSService")
+    assert names.index("InterviewInput") < names.index("ObservedOpenAITTSService")
+    assert names.index("ObservedOpenAITTSService") < names.index("DeliveryObserver")
+    tts = next(p for p in live.pipeline.processors if isinstance(p, OpenAITTSService))
     assert tts._settings.voice == "shimmer"
     assert tts._settings.speed == 1.0
     assert tts._settings.instructions == load_prompt("tts_style")
+    assert tts._stop_frame_timeout_s == 20.0
     await live.stop()
     await connection.disconnect()
     assert live.log.path.exists()
@@ -82,7 +84,7 @@ async def test_tts_one_does_not_receive_unsupported_style_instructions(tmp_path)
     )
     connection = SmallWebRTCConnection()
     live = LiveSession(connection, settings)
-    tts = next(p for p in live.pipeline.processors if type(p).__name__ == "OpenAITTSService")
+    tts = next(p for p in live.pipeline.processors if isinstance(p, OpenAITTSService))
     assert tts._settings.instructions is None
     await live.stop()
     await connection.disconnect()
@@ -93,7 +95,7 @@ async def test_pipeline_provider_error_reaches_session_log(tmp_path):
     settings = Settings(deepgram_api_key="test-dg", openai_api_key="test-oa", session_dir=tmp_path)
     connection = SmallWebRTCConnection()
     live = LiveSession(connection, settings)
-    tts = next(p for p in live.pipeline.processors if type(p).__name__ == "OpenAITTSService")
+    tts = next(p for p in live.pipeline.processors if isinstance(p, OpenAITTSService))
     await live.worker._call_event_handler(
         "on_pipeline_error", ErrorFrame(error="synthetic TTS failure", processor=tts)
     )

@@ -95,10 +95,49 @@ async def test_audio_observer_correlates_tts_frames_with_utterance_id(tmp_path):
     assert "tts_started" in names
     assert names.count("tts_first_audio_generated") == 1
     assert any(
-        row["event"] == "tts_generation_finished" and row["utterance_id"] == utterance_id
+        row["event"] == "tts_generation_finished"
+        and row["utterance_id"] == utterance_id
+        and row["audio_bytes"] == 32
+        and row["audio_chunks"] == 1
         for row in events(log)
     )
     assert session.controller.stage is Stage.DELIVERING
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_audio_from_cancelled_tts_context_is_not_forwarded(tmp_path):
+    async def infer(_kind, _payload):
+        raise AssertionError("No inference expected")
+
+    async def speak(_utterance):
+        pass
+
+    log = SessionLog(tmp_path, "late-audio")
+    session = InterviewSession(log, infer, speak, lambda _: None)
+    observer = AudioObserver()
+    observer.session = session
+    forwarded = []
+
+    async def forward(frame, _direction=FrameDirection.DOWNSTREAM):
+        forwarded.append(frame)
+
+    observer.push_frame = forward
+    await session.start()
+    first = session.controller.pending
+    await observer.process_frame(UtteranceMarkerFrame(first.id), FrameDirection.DOWNSTREAM)
+    await observer.process_frame(TTSStartedFrame(context_id="old"), FrameDirection.DOWNSTREAM)
+    await session.user_started()
+    await observer.process_frame(
+        TTSAudioRawFrame(b"\x01" * 32, 24000, 1, context_id="old"),
+        FrameDirection.DOWNSTREAM,
+    )
+    assert not any(isinstance(frame, TTSAudioRawFrame) for frame in forwarded)
+    assert not any(
+        row["event"] == "tts_first_audio_generated" and row["utterance_id"] == first.id
+        for row in events(log)
+    )
+    assert any(row["event"] == "stale_tts_audio_discarded" for row in events(log))
     await session.close()
 
 

@@ -2,6 +2,8 @@
 
 RehearseAI is a local browser voice mock-interview coach. It uses a delivery-aware opening and four-question controller, SmallWebRTC browser transport, Deepgram streaming STT, OpenAI text LLM, OpenAI TTS, and local session logs. Conversational opening and detour changes have offline checks; their spoken quality still needs a microphone test.
 
+The recurring no-audio warning was traced to Pipecat's TTS context timeout, which could expire before the configured OpenAI voice returned its first chunk. A real instrumented request first yielded audio at 9.673 seconds, after an eight-second context timeout had already reported silence. The targeted fix uses a 20-second context timeout and discards late audio from cancelled contexts. See [TTS_DIAGNOSIS.md](TTS_DIAGNOSIS.md) for the exact timelines, bounded paid checks, and remaining live verification. A genuinely silent response may now take up to 17 additional seconds to report.
+
 ## Latest conversation and voice-error investigation
 
 The real logs `sessions/5987ded4-2927-4dae-a4c8-5bb27d7b52a4.jsonl` and `sessions/7c943da8-7333-4d75-b480-6e7957c1b7dc.jsonl` identify the routing failures. At the readiness gate, “Can you tell me your name?” was classified as unclear readiness and led to a readiness clarification. During name collection, “Name is Divanj. And what should I call you?” entered the name-only handler, lost the supplied name, and went straight to readiness. “Sorry. Can you repeat the question?” was treated as an answer because the repeat matcher required the whole turn to contain only the request. A decision then advanced from “I didn't have any project” to question two; football later received question-two prompts. These are distinct routing and project-example policy failures.
