@@ -194,7 +194,7 @@ def inference_adapter(llm: OpenAILLMService):
 
 
 class LiveSession:
-    def __init__(self, connection: Any, settings: Settings) -> None:
+    def __init__(self, connection: Any, settings: Settings, *, build_id: str | None = None) -> None:
         self.connection = connection
         self.log = SessionLog(settings.session_dir, str(uuid.uuid4()))
         transport = SmallWebRTCTransport(
@@ -215,6 +215,7 @@ class LiveSession:
             connection.send_app_message,
             turn_pause_secs=settings.turn_pause_secs,
             cancel_audio=input_adapter.cancel_audio,
+            build_id=build_id,
         )
         input_adapter.session = self.session
         audio_observer.session = self.session

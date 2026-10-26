@@ -160,6 +160,8 @@ async def test_explicit_stop_phrasings_are_not_inferred_as_answers(tmp_path, spo
         ["Stop the interview."],
         ["Stop the interview, please."],
         ["I'd like to stop."],
+        ["I wanna", "end the interview."],
+        ["I don't wanna", "proceed further."],
     ],
 )
 @pytest.mark.asyncio
@@ -211,6 +213,8 @@ async def test_spoken_stop_segments_enter_early_closing_before_turn_completion(t
         "I ended the interview yesterday.",
         "Don't end the interview.",
         "I don't want to end the interview.",
+        "I don't wanna end the interview.",
+        "I don't wanna proceed further with this project.",
     ],
 )
 @pytest.mark.asyncio
@@ -287,6 +291,173 @@ async def test_stop_invalidates_pending_next_question_before_it_can_play(tmp_pat
         and row["utterance_id"] == pending_question.id
         for row in rows
     )
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_latest_stop_request_cancels_pending_question_and_latches(tmp_path):
+    input_adapter = InterviewInput()
+    input_adapter.push_frame = lambda *_args, **_kwargs: asyncio.sleep(0)
+    calls = []
+    spoken = []
+
+    async def infer(kind, payload):
+        calls.append(kind)
+        if kind == "decision":
+            return {"action": "advance", "text": ""}
+        assert payload["answers_by_question"] == [["I built an API"], [], [], []]
+        return {"lines": ["We'll end early; you described building an API."]}
+
+    async def speak(utterance):
+        spoken.append(utterance)
+
+    log = SessionLog(tmp_path, "wanna-stop")
+    session = InterviewSession(log, infer, speak, lambda _: None)
+    input_adapter.session = session
+    await session.start()
+    finish_output(session, begin_output(session))
+    await feed_turn(input_adapter, ["I built an API"])
+    await settle()
+    pending_question = session.controller.pending
+    assert pending_question.text == QUESTIONS[1]
+
+    await input_adapter.process_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    await input_adapter.process_frame(final_segment("I wanna", 1), FrameDirection.DOWNSTREAM)
+    await input_adapter.process_frame(
+        final_segment("end the interview.", 2), FrameDirection.DOWNSTREAM
+    )
+    assert session.controller.stage is Stage.EARLY_CLOSING
+    session.tts_started(pending_question.id, "late-question")
+    session.tts_first_audio("late-question")
+    session.tts_finished("late-question")
+    session.bot_started()
+    session.bot_stopped()
+    await input_adapter.process_frame(UserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    await settle()
+    assert calls == ["decision", "early_feedback"]
+    assert session.controller.pending.kind.name == "EARLY_FEEDBACK"
+    assert not any(
+        row["event"] in {"agent_output_started", "agent_delivery_reported"}
+        and row["utterance_id"] == pending_question.id
+        for row in events(log)
+    )
+
+    # Further candidate speech may interrupt the closing, but cannot reopen a question.
+    await input_adapter.process_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    await input_adapter.process_frame(final_segment("I mean, now", 3), FrameDirection.DOWNSTREAM)
+    await input_adapter.process_frame(UserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    assert session.controller.pending.kind.name == "EARLY_FEEDBACK"
+    assert calls == ["decision", "early_feedback"]
+    finish_output(session, begin_output(session))
+    assert session.controller.stage is Stage.ENDED_EARLY
+    await feed_turn(input_adapter, ["No."])
+    assert session.controller.stage is Stage.ENDED_EARLY
+    assert not any(utterance.text == QUESTIONS[2] for utterance in spoken)
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_withdrawal_in_noisy_segmented_answer_bypasses_decision(tmp_path):
+    input_adapter = InterviewInput()
+    input_adapter.push_frame = lambda *_args, **_kwargs: asyncio.sleep(0)
+    calls = []
+
+    async def infer(kind, payload):
+        calls.append(kind)
+        if kind == "decision":
+            return {"action": "advance", "text": ""}
+        assert payload["answers_by_question"] == [["I built an API"], [], [], []]
+        return {"lines": ["We'll end early; thanks for describing your API."]}
+
+    log = SessionLog(tmp_path, "withdrawal")
+    session = InterviewSession(log, infer, input_adapter.speak, lambda _: None)
+    input_adapter.session = session
+    await session.start()
+    finish_output(session, begin_output(session))
+    await feed_turn(input_adapter, ["I built an API"])
+    await settle()
+    finish_output(session, begin_output(session))
+    assert session.controller.current_question_number == 2
+
+    await input_adapter.process_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    await input_adapter.process_frame(
+        final_segment("I want to enter entity because I don't wanna", 1),
+        FrameDirection.DOWNSTREAM,
+    )
+    assert session.controller.stage is Stage.AWAITING_ANSWER
+    await input_adapter.process_frame(
+        final_segment("proceed further. There's no technical", 2),
+        FrameDirection.DOWNSTREAM,
+    )
+    assert session.controller.stage is Stage.EARLY_CLOSING
+    await input_adapter.process_frame(UserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    await settle()
+    assert calls == ["decision", "early_feedback"]
+    assert session.controller.answers[1] == ()
+    assert session.controller.pending.kind.name == "EARLY_FEEDBACK"
+    assert not any(
+        row["event"] == "agent_prepared" and row["text"] == QUESTIONS[2] for row in events(log)
+    )
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_latch_discards_cancellation_resistant_decision(tmp_path):
+    input_adapter = InterviewInput()
+    input_adapter.push_frame = lambda *_args, **_kwargs: asyncio.sleep(0)
+    decision_started = asyncio.Event()
+    release_decision = asyncio.Event()
+    calls = []
+
+    async def infer(kind, payload):
+        calls.append(kind)
+        if kind == "decision":
+            decision_started.set()
+            while not release_decision.is_set():
+                try:
+                    await release_decision.wait()
+                except asyncio.CancelledError:
+                    pass
+            return {"action": "advance", "text": ""}
+        assert payload["answers_by_question"] == [["I built an API"], [], [], []]
+        return {"lines": ["We'll end early; thanks for describing your API."]}
+
+    log = SessionLog(tmp_path, "late-decision")
+    session = InterviewSession(log, infer, input_adapter.speak, lambda _: None)
+    input_adapter.session = session
+    await session.start()
+    finish_output(session, begin_output(session))
+    await feed_turn(input_adapter, ["I built an API"])
+    await decision_started.wait()
+    await feed_turn(input_adapter, ["I wanna", "end the interview."])
+    release_decision.set()
+    await settle()
+    assert calls == ["decision", "early_feedback"]
+    assert session.controller.pending.kind.name == "EARLY_FEEDBACK"
+    assert not any(
+        row["event"] == "agent_prepared" and row["text"] == QUESTIONS[1] for row in events(log)
+    )
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_before_first_output_retries_unheard_question(tmp_path):
+    input_adapter = InterviewInput()
+    input_adapter.push_frame = lambda *_args, **_kwargs: asyncio.sleep(0)
+
+    async def infer(_kind, _payload):
+        raise AssertionError("No inference should run for unheard question")
+
+    log = SessionLog(tmp_path, "startup")
+    session = InterviewSession(log, infer, input_adapter.speak, lambda _: None)
+    input_adapter.session = session
+    await session.start()
+    first_id = session.controller.pending.id
+    await feed_turn(input_adapter, ["I am proud of a project I built."])
+    assert session.controller.answers == ((), (), (), ())
+    assert session.controller.pending.id != first_id
+    assert session.controller.pending.text == QUESTIONS[0]
+    assert not any(row["event"] == "agent_output_started" for row in events(log))
     await session.close()
 
 

@@ -54,7 +54,12 @@ function handleEvent(message) {
     document.querySelector('#session-id').textContent = `Session ${entry.session_id}`;
   } else if (entry.event === 'agent_prepared') {
     prepared.set(entry.utterance_id, entry);
-    status('Preparing response…', 'Microphone on', true);
+    status(
+      entry.utterance_kind === 'question' && entry.question_number === 1
+        ? 'Preparing first question — wait for audio…'
+        : 'Preparing response…',
+      'Microphone on', true,
+    );
   } else if (entry.event === 'agent_output_started') {
     const item = prepared.get(entry.utterance_id);
     if (!item) return;

@@ -12,6 +12,7 @@ from rehearse_ai.interview import (
     ReplyKind,
     Stage,
     Utterance,
+    UtteranceKind,
 )
 from rehearse_ai.session_log import SessionLog
 
@@ -41,15 +42,25 @@ _END_CLAUSE = re.compile(
     re.I,
 )
 _DONE_CLAUSE = re.compile(r"(?:i'm|i am|we're|we are)\s+(?:done|finished)", re.I)
+_WITHDRAW_CLAUSE = re.compile(
+    r"(?:i|we)\s+(?:don't|do not|dont)\s+want\s+to\s+"
+    r"(?:proceed|continue|go on|carry on|keep going)"
+    r"(?:\s+(?:further|anymore|now|with (?:this|the) (?:interview|session|practice)))?",
+    re.I,
+)
 
 
 def _is_stop_request(text: str) -> bool:
     """Match a complete, affirmative request clause, including STT sentence splits."""
-    normalized = text.replace("’", "'")
+    normalized = re.sub(r"\bwanna\b", "want to", text.replace("’", "'"), flags=re.I)
     for sentence in re.split(r"[.!?]+", normalized):
-        for clause in re.split(r"\bbut\b", sentence, flags=re.I):
+        for clause in re.split(r"\b(?:but|because)\b", sentence, flags=re.I):
             clause = " ".join(re.sub(r"[,;:]", " ", clause).split())
-            if _END_CLAUSE.fullmatch(clause) or _DONE_CLAUSE.fullmatch(clause):
+            if (
+                _END_CLAUSE.fullmatch(clause)
+                or _DONE_CLAUSE.fullmatch(clause)
+                or _WITHDRAW_CLAUSE.fullmatch(clause)
+            ):
                 return True
     return False
 
@@ -64,6 +75,7 @@ class InterviewSession:
         *,
         turn_pause_secs: float = 1.1,
         cancel_audio: CancelAudio | None = None,
+        build_id: str | None = None,
     ) -> None:
         self.controller = InterviewController()
         self.log = log
@@ -87,6 +99,8 @@ class InterviewSession:
         self._turn_number = 0
         self._answer_number = 0
         self._turn_pause_secs = turn_pause_secs
+        self._build_id = build_id
+        self._stop_latched = False
         self._closed = False
 
     @property
@@ -116,11 +130,16 @@ class InterviewSession:
             )
 
     async def detect_stop_from_segments(self, text: str) -> bool:
-        if self._closed or self.controller.stage in {
-            Stage.COMPLETE,
-            Stage.ENDED_EARLY,
-            Stage.EARLY_CLOSING,
-        }:
+        if (
+            self._closed
+            or self._stop_latched
+            or self.controller.stage
+            in {
+                Stage.COMPLETE,
+                Stage.ENDED_EARLY,
+                Stage.EARLY_CLOSING,
+            }
+        ):
             return False
         if not _is_stop_request(text):
             return False
@@ -130,10 +149,14 @@ class InterviewSession:
     async def start(self) -> None:
         if self._closed or self.controller.stage is not Stage.NEW:
             return
-        self._record("session_started", speaker=None)
+        self._record("session_started", speaker=None, build_id=self._build_id)
         await self._queue_speech(self.controller.start())
 
     async def _queue_speech(self, utterance: Utterance) -> None:
+        if self.controller.pending != utterance or (
+            self._stop_latched and utterance.kind is not UtteranceKind.EARLY_FEEDBACK
+        ):
+            return
         self._active_prompt_id = utterance.id
         self._record(
             "agent_prepared",
@@ -153,7 +176,7 @@ class InterviewSession:
         await self._speak(utterance)
 
     async def user_started(self) -> None:
-        if self._closed:
+        if self._closed or self.controller.stage in {Stage.COMPLETE, Stage.ENDED_EARLY}:
             return
         self._generation += 1
         task = self._response_task
@@ -245,16 +268,21 @@ class InterviewSession:
         )
         self._turn_started_at = None
 
-        if _is_stop_request(answer) and self.controller.stage is not Stage.EARLY_CLOSING:
+        if not self._stop_latched and _is_stop_request(answer):
             await self._end_early(answer)
             return
-        if self.controller.stage is Stage.EARLY_CLOSING:
-            if any(self.controller.answers):
-                self._start_response()
-            else:
-                await self._queue_speech(
-                    self.controller.prepare_early_feedback("We'll end here. Thanks for practicing.")
-                )
+        if self._stop_latched:
+            if self.controller.stage is Stage.EARLY_CLOSING:
+                if any(self.controller.answers):
+                    self._start_response()
+                else:
+                    await self._queue_speech(
+                        self.controller.prepare_early_feedback(
+                            "We'll end here. Thanks for practicing."
+                        )
+                    )
+            elif self.controller.interrupted_utterance is not None:
+                await self._queue_speech(self.controller.retry_interrupted())
             return
 
         if _SKIP.fullmatch(answer) and self.controller.interrupted_utterance is not None:
@@ -330,6 +358,9 @@ class InterviewSession:
         self._start_response()
 
     async def _end_early(self, request: str, *, defer_closing: bool = False) -> None:
+        if self._stop_latched:
+            return
+        self._stop_latched = True
         self._generation += 1
         task = self._response_task
         if task and not task.done():
@@ -367,6 +398,8 @@ class InterviewSession:
                 )
 
     def _start_response(self) -> None:
+        if self._stop_latched and self.controller.stage is not Stage.EARLY_CLOSING:
+            return
         self._generation += 1
         generation = self._generation
         self._response_task = asyncio.create_task(self._respond(generation))
@@ -399,7 +432,7 @@ class InterviewSession:
 
     async def _respond(self, generation: int) -> None:
         try:
-            if self.controller.stage is Stage.AWAITING_PROPOSAL:
+            if not self._stop_latched and self.controller.stage is Stage.AWAITING_PROPOSAL:
                 started_at = time.perf_counter()
                 self._record(
                     "inference_started",
@@ -457,7 +490,7 @@ class InterviewSession:
                     await self._queue_speech(utterance)
                     return
 
-            if self.controller.stage is Stage.AWAITING_FEEDBACK:
+            if not self._stop_latched and self.controller.stage is Stage.AWAITING_FEEDBACK:
                 started_at = time.perf_counter()
                 self._record(
                     "inference_started",

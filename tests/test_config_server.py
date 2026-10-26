@@ -25,10 +25,16 @@ def test_bad_local_config_is_actionable(tmp_path):
 def test_local_browser_assets_and_health_load_without_provider_calls(tmp_path):
     settings = Settings(deepgram_api_key="test-dg", openai_api_key="test-oa", session_dir=tmp_path)
     with TestClient(create_app(settings)) as client:
-        assert client.get("/healthz").json() == {"status": "ready"}
+        health_response = client.get("/healthz")
+        health = health_response.json()
+        assert health["status"] == "ready"
+        assert health["build_id"].startswith("0.1.0+")
+        assert health_response.headers["cache-control"] == "no-store"
         page = client.get("/")
         assert page.status_code == 200
         assert "Start interview" in page.text
+        assert f"Build {health['build_id']}" in page.text
+        assert page.headers["cache-control"] == "no-store"
         assert client.get("/assets/app.js").status_code == 200
         assert client.get("/assets/styles.css").status_code == 200
         assert client.post("/api/offer", json={"type": "bad"}).status_code == 400

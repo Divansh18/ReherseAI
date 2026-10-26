@@ -1,12 +1,14 @@
 """Loopback HTTP signaling and static assets for one browser voice session."""
 
 import asyncio
+import hashlib
 from contextlib import asynccontextmanager
+from importlib.metadata import version
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pipecat.transports.smallwebrtc.request_handler import (
     SmallWebRTCRequest,
@@ -17,9 +19,21 @@ from rehearse_ai.config import ConfigurationError, Settings
 from rehearse_ai.pipeline import LiveSession
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
+PACKAGE_DIR = WEB_DIR.parent
+
+
+def source_build_id() -> str:
+    """Freeze a source fingerprint when the server starts, even before a commit."""
+    digest = hashlib.sha256()
+    for path in sorted(PACKAGE_DIR.rglob("*")):
+        if path.suffix in {".py", ".txt", ".html", ".css", ".js"}:
+            digest.update(str(path.relative_to(PACKAGE_DIR)).encode())
+            digest.update(path.read_bytes())
+    return f"{version('rehearse-ai')}+{digest.hexdigest()[:12]}"
 
 
 def create_app(settings: Settings) -> FastAPI:
+    build_id = source_build_id()
     handler = SmallWebRTCRequestHandler()
     sessions: set[LiveSession] = set()
     tasks: set[asyncio.Task[None]] = set()
@@ -34,15 +48,20 @@ def create_app(settings: Settings) -> FastAPI:
         await handler.close()
 
     app = FastAPI(lifespan=lifespan)
+    app.state.build_id = build_id
     app.mount("/assets", StaticFiles(directory=WEB_DIR), name="assets")
 
     @app.get("/")
-    async def index() -> FileResponse:
-        return FileResponse(WEB_DIR / "index.html")
+    async def index() -> HTMLResponse:
+        page = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        return HTMLResponse(
+            page.replace("__BUILD_ID__", build_id), headers={"Cache-Control": "no-store"}
+        )
 
     @app.get("/healthz")
-    async def health() -> dict[str, str]:
-        return {"status": "ready"}
+    async def health(response: Response) -> dict[str, str]:
+        response.headers["Cache-Control"] = "no-store"
+        return {"status": "ready", "build_id": build_id}
 
     @app.post("/api/offer")
     async def offer(request: Request) -> dict[str, str]:
@@ -55,7 +74,7 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=400, detail="Invalid WebRTC offer") from exc
 
         async def connected(connection: object) -> None:
-            live = LiveSession(connection, settings)
+            live = LiveSession(connection, settings, build_id=build_id)
             sessions.add(live)
             task = asyncio.create_task(live.run())
             tasks.add(task)
@@ -81,4 +100,6 @@ def main() -> None:
         settings = Settings.load()
     except ConfigurationError as exc:
         raise SystemExit(f"Configuration error: {exc}") from None
-    uvicorn.run(create_app(settings), host=settings.host, port=settings.port)
+    app = create_app(settings)
+    print(f"RehearseAI build {app.state.build_id}", flush=True)
+    uvicorn.run(app, host=settings.host, port=settings.port)
