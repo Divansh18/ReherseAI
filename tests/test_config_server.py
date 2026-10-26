@@ -4,6 +4,7 @@ from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 
 from rehearse_ai.config import ConfigurationError, Settings
 from rehearse_ai.pipeline import LiveSession
+from rehearse_ai.prompts import load_prompt
 from rehearse_ai.server import create_app
 
 
@@ -20,6 +21,13 @@ def test_bad_local_config_is_actionable(tmp_path):
         Settings.load({**env, "REHEARSE_TTS_MODEL": "unknown"}, tmp_path / "none")
     with pytest.raises(ConfigurationError, match="REHEARSE_TURN_PAUSE_SECS"):
         Settings.load({**env, "REHEARSE_TURN_PAUSE_SECS": "0"}, tmp_path / "none")
+    with pytest.raises(ConfigurationError, match="REHEARSE_TTS_SPEED"):
+        Settings.load({**env, "REHEARSE_TTS_SPEED": "4.5"}, tmp_path / "none")
+    with pytest.raises(ConfigurationError, match="REHEARSE_TTS_VOICE is unavailable with tts-1"):
+        Settings.load(
+            {**env, "REHEARSE_TTS_MODEL": "tts-1", "REHEARSE_TTS_VOICE": "marin"},
+            tmp_path / "none",
+        )
 
 
 def test_local_browser_assets_and_health_load_without_provider_calls(tmp_path):
@@ -33,6 +41,7 @@ def test_local_browser_assets_and_health_load_without_provider_calls(tmp_path):
         page = client.get("/")
         assert page.status_code == 200
         assert "Start interview" in page.text
+        assert "voice is AI-generated" in page.text
         assert f"Build {health['build_id']}" in page.text
         assert page.headers["cache-control"] == "no-store"
         assert client.get("/assets/app.js").status_code == 200
@@ -49,6 +58,26 @@ async def test_locked_pipecat_pipeline_assembles_without_provider_calls(tmp_path
     assert names.index("DeepgramSTTService") < names.index("InterviewInput")
     assert names.index("InterviewInput") < names.index("OpenAITTSService")
     assert names.index("OpenAITTSService") < names.index("DeliveryObserver")
+    tts = next(p for p in live.pipeline.processors if type(p).__name__ == "OpenAITTSService")
+    assert tts._settings.voice == "shimmer"
+    assert tts._settings.speed == 1.0
+    assert tts._settings.instructions == load_prompt("tts_style")
     await live.stop()
     await connection.disconnect()
     assert live.log.path.exists()
+
+
+@pytest.mark.asyncio
+async def test_tts_one_does_not_receive_unsupported_style_instructions(tmp_path):
+    settings = Settings(
+        deepgram_api_key="test-dg",
+        openai_api_key="test-oa",
+        session_dir=tmp_path,
+        tts_model="tts-1",
+    )
+    connection = SmallWebRTCConnection()
+    live = LiveSession(connection, settings)
+    tts = next(p for p in live.pipeline.processors if type(p).__name__ == "OpenAITTSService")
+    assert tts._settings.instructions is None
+    await live.stop()
+    await connection.disconnect()

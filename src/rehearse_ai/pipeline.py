@@ -64,6 +64,12 @@ FEEDBACK_SCHEMA = {
     "required": ["lines"],
     "additionalProperties": False,
 }
+OPENING_SCHEMA = {
+    "type": "object",
+    "properties": {"text": {"type": "string"}},
+    "required": ["text"],
+    "additionalProperties": False,
+}
 
 
 @dataclass
@@ -177,11 +183,17 @@ class AudioObserver(FrameProcessor):
 
 def inference_adapter(llm: OpenAILLMService):
     async def infer(kind: str, payload: dict[str, Any]) -> Mapping[str, Any]:
+        schema = {
+            "decision": DECISION_SCHEMA,
+            "opening_ack": OPENING_SCHEMA,
+            "feedback": FEEDBACK_SCHEMA,
+            "early_feedback": FEEDBACK_SCHEMA,
+        }[kind]
         response = await llm.run_inference(
             LLMContext(messages=[{"role": "user", "content": json.dumps(payload)}]),
             max_tokens=220,
             system_instruction=load_prompt(kind),
-            response_schema=DECISION_SCHEMA if kind == "decision" else FEEDBACK_SCHEMA,
+            response_schema=schema,
         )
         if response is None:
             raise ValueError("Empty LLM response")
@@ -251,7 +263,14 @@ class LiveSession:
                 OpenAITTSService(
                     api_key=settings.openai_api_key,
                     settings=OpenAITTSService.Settings(
-                        model=settings.tts_model, voice=settings.tts_voice
+                        model=settings.tts_model,
+                        voice=settings.tts_voice,
+                        speed=settings.tts_speed,
+                        instructions=(
+                            load_prompt("tts_style")
+                            if settings.tts_model == "gpt-4o-mini-tts"
+                            else None
+                        ),
                     ),
                 ),
                 audio_observer,

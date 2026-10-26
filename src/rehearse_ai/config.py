@@ -22,7 +22,8 @@ class Settings:
     stt_model: str = "nova-3-general"
     llm_model: str = "gpt-4.1-mini"
     tts_model: str = "gpt-4o-mini-tts"
-    tts_voice: str = "coral"
+    tts_voice: str = "shimmer"
+    tts_speed: float = 1.0
     vad_confidence: float = 0.7
     vad_start_secs: float = 0.2
     vad_stop_secs: float = 0.35
@@ -88,9 +89,22 @@ class Settings:
             "shimmer",
             "verse",
         }
-        voice = values.get("REHEARSE_TTS_VOICE", "coral")
+        voice = values.get("REHEARSE_TTS_VOICE", "shimmer")
         if voice not in voices:
             raise ConfigurationError("REHEARSE_TTS_VOICE is not a supported OpenAI built-in voice")
+        tts_model = values.get("REHEARSE_TTS_MODEL", "gpt-4o-mini-tts")
+        if tts_model == "tts-1" and voice not in {
+            "alloy",
+            "ash",
+            "coral",
+            "echo",
+            "fable",
+            "nova",
+            "onyx",
+            "shimmer",
+            "sage",
+        }:
+            raise ConfigurationError("REHEARSE_TTS_VOICE is unavailable with tts-1")
 
         return cls(
             deepgram_api_key=values["DEEPGRAM_API_KEY"],
@@ -100,8 +114,9 @@ class Settings:
             session_dir=Path(values.get("REHEARSE_SESSION_DIR", "sessions")),
             stt_model=values.get("REHEARSE_STT_MODEL", "nova-3-general"),
             llm_model=values.get("REHEARSE_LLM_MODEL", "gpt-4.1-mini"),
-            tts_model=values.get("REHEARSE_TTS_MODEL", "gpt-4o-mini-tts"),
+            tts_model=tts_model,
             tts_voice=voice,
+            tts_speed=number("REHEARSE_TTS_SPEED", "1.0", low=0.25, high=4.0),
             vad_confidence=number("REHEARSE_VAD_CONFIDENCE", "0.7", low=0.1, high=1.0),
             vad_start_secs=number("REHEARSE_VAD_START_SECS", "0.2", low=0.05, high=2.0),
             vad_stop_secs=number("REHEARSE_VAD_STOP_SECS", "0.35", low=0.1, high=2.0),

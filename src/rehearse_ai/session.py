@@ -23,7 +23,8 @@ CancelAudio = Callable[[], Awaitable[None]]
 
 _REPEAT = re.compile(
     r"^(?:please\s+)?(?:can you\s+|could you\s+|would you\s+)?"
-    r"(?:repeat(?: the (?:question|last question))?|say (?:that|the question) again)\??[.!]?$",
+    r"(?:repeat(?: that| the (?:question|last question))?"
+    r"|say (?:that|the question) again)\??[.!]?$",
     re.IGNORECASE,
 )
 _SKIP = re.compile(r"^(?:please\s+)?(?:skip(?: this question)?|next question)\??[.!]?$", re.I)
@@ -48,6 +49,22 @@ _WITHDRAW_CLAUSE = re.compile(
     r"(?:\s+(?:further|anymore|now|with (?:this|the) (?:interview|session|practice)))?",
     re.I,
 )
+_READY = re.compile(
+    r"(?:yes|yeah|yep|sure|okay|ok|absolutely|of course|sounds good|ready"
+    r"|i(?: am|'m) ready(?: to (?:start|begin|go))?|i(?: am|'m) good to go"
+    r"|let'?s (?:start|begin|go|do it)|we can (?:start|begin)|go ahead)"
+    r"(?: i(?: am|'m) ready| let'?s (?:start|begin|go|do it))?",
+    re.I,
+)
+_NOT_READY = re.compile(
+    r"\b(?:not yet|not ready|don't want to (?:start|begin)|do not want to (?:start|begin))\b",
+    re.I,
+)
+
+
+def _is_ready(text: str) -> bool:
+    normalized = " ".join(re.sub(r"[,!?;:.]", " ", text.replace("’", "'")).split())
+    return not _NOT_READY.search(normalized) and bool(_READY.fullmatch(normalized))
 
 
 def _is_stop_request(text: str) -> bool:
@@ -235,7 +252,11 @@ class InterviewSession:
             return
         answer = text.strip()
         self._last_turn_end = time.perf_counter()
-        continuing = self.controller.stage in {Stage.AWAITING_PROPOSAL, Stage.AWAITING_FEEDBACK}
+        continuing = self.controller.stage in {
+            Stage.AWAITING_OPENING_ACK,
+            Stage.AWAITING_PROPOSAL,
+            Stage.AWAITING_FEEDBACK,
+        }
         if not continuing:
             self._answer_number += 1
         duration = (
@@ -283,6 +304,9 @@ class InterviewSession:
                     )
             elif self.controller.interrupted_utterance is not None:
                 await self._queue_speech(self.controller.retry_interrupted())
+            return
+
+        if await self._route_opening(answer):
             return
 
         if _SKIP.fullmatch(answer) and self.controller.interrupted_utterance is not None:
@@ -357,6 +381,77 @@ class InterviewSession:
 
         self._start_response()
 
+    async def _route_opening(self, answer: str) -> bool:
+        interrupted = self.controller.interrupted_utterance
+        opening_kinds = {
+            UtteranceKind.GREETING,
+            UtteranceKind.READINESS,
+            UtteranceKind.OPENING_WAIT,
+        }
+        if interrupted is not None and interrupted.kind in opening_kinds:
+            if not answer or _REPEAT.fullmatch(answer):
+                await self._queue_speech(self.controller.retry_interrupted())
+                return True
+            if (
+                interrupted.kind is not UtteranceKind.OPENING_WAIT
+                and self._interrupted_output_id != interrupted.id
+            ):
+                self._record(
+                    "unheard_prompt_recovery",
+                    speaker=None,
+                    utterance_id=interrupted.id,
+                    candidate_text=answer,
+                )
+                await self._queue_speech(self.controller.retry_interrupted())
+                return True
+            self.controller.accept_barge_in_answer(answer)
+            self._interrupted_output_id = None
+            self._record("barge_in_answer_accepted", speaker="candidate", text=answer)
+
+        if self.controller.stage is Stage.AWAITING_GREETING:
+            try:
+                utterance = (
+                    self.controller.request_opening_repeat()
+                    if not answer or _REPEAT.fullmatch(answer)
+                    else self.controller.submit_greeting(answer)
+                )
+            except LimitReached:
+                self._record("opening_repeat_limit", speaker=None, opening_phase="greeting")
+                return True
+            if utterance is not None:
+                await self._queue_speech(utterance)
+            else:
+                self._start_response()
+            return True
+
+        if self.controller.stage is Stage.AWAITING_OPENING_ACK:
+            if _REPEAT.fullmatch(answer):
+                try:
+                    await self._queue_speech(self.controller.request_opening_repeat())
+                except LimitReached:
+                    self._record("opening_repeat_limit", speaker=None, opening_phase="greeting")
+                return True
+            if answer and interrupted is None:
+                self.controller.add_greeting_continuation(answer)
+            self._start_response()
+            return True
+
+        if self.controller.stage is Stage.AWAITING_READINESS:
+            if not answer or _REPEAT.fullmatch(answer):
+                try:
+                    await self._queue_speech(self.controller.request_opening_repeat())
+                except LimitReached:
+                    self._record("opening_repeat_limit", speaker=None, opening_phase="readiness")
+                return True
+            ready = _is_ready(answer)
+            self._record("readiness_response", speaker="candidate", ready=ready)
+            utterance = self.controller.submit_readiness(ready)
+            if utterance is not None:
+                await self._queue_speech(utterance)
+            return True
+
+        return False
+
     async def _end_early(self, request: str, *, defer_closing: bool = False) -> None:
         if self._stop_latched:
             return
@@ -410,6 +505,7 @@ class InterviewSession:
         return {
             "current_question_number": self.controller.current_question_number,
             "current_question": self.controller.current_question,
+            "greeting_response": self.controller.greeting_response,
             "answers_by_question": [list(turns) for turns in self.controller.answers],
             "current_question_answers": current_answers,
             "current_question_answer": " ".join(current_answers),
@@ -432,6 +528,28 @@ class InterviewSession:
 
     async def _respond(self, generation: int) -> None:
         try:
+            if not self._stop_latched and self.controller.stage is Stage.AWAITING_OPENING_ACK:
+                self._record(
+                    "inference_started", speaker=None, generation=generation, purpose="opening_ack"
+                )
+                result = await self._infer("opening_ack", self._payload())
+                if generation != self._generation or self._closed:
+                    self._record("inference_stale_discarded", speaker=None, generation=generation)
+                    return
+                acknowledgement = result.get("text")
+                if not isinstance(acknowledgement, str):
+                    raise ValueError("Opening response did not contain text")
+                utterance = self.controller.prepare_readiness(acknowledgement)
+                self._record(
+                    "inference_completed",
+                    speaker=None,
+                    generation=generation,
+                    purpose="opening_ack",
+                    validated=True,
+                )
+                await self._queue_speech(utterance)
+                return
+
             if not self._stop_latched and self.controller.stage is Stage.AWAITING_PROPOSAL:
                 started_at = time.perf_counter()
                 self._record(
@@ -545,13 +663,20 @@ class InterviewSession:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._record("response_error", speaker=None, error_type=type(exc).__name__)
-            if self.controller.stage is Stage.EARLY_CLOSING and generation == self._generation:
-                await self._queue_speech(
-                    self.controller.prepare_early_feedback(
-                        "We'll stop here. Thanks for sharing what you have so far."
+            if (
+                self.controller.stage is Stage.AWAITING_OPENING_ACK
+                and generation == self._generation
+            ):
+                self._record("opening_ack_fallback", speaker=None, error_type=type(exc).__name__)
+                await self._queue_speech(self.controller.prepare_readiness("Thanks for sharing."))
+            else:
+                self._record("response_error", speaker=None, error_type=type(exc).__name__)
+                if self.controller.stage is Stage.EARLY_CLOSING and generation == self._generation:
+                    await self._queue_speech(
+                        self.controller.prepare_early_feedback(
+                            "We'll stop here. Thanks for sharing what you have so far."
+                        )
                     )
-                )
 
     def tts_started(self, utterance_id: int, context_id: str | None) -> None:
         pending = self.controller.pending

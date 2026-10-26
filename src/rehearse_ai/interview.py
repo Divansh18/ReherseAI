@@ -9,14 +9,24 @@ QUESTIONS = (
     "How did you know it was working well?",
     "What would you do differently now?",
 )
+GREETING = "Hey, how are you doing today?"
+READINESS_PROMPT = (
+    "We'll go through four questions about your project, then I'll give you short feedback. "
+    "Are you ready to begin?"
+)
+READINESS_WAIT = "No rush. Tell me when you're ready to begin."
 
 MAX_FOLLOW_UPS_PER_QUESTION = 1
 MAX_CLARIFICATIONS_PER_QUESTION = 1
+MAX_OPENING_REPEATS = 1
 
 
 class Stage(Enum):
     NEW = auto()
     DELIVERING = auto()
+    AWAITING_GREETING = auto()
+    AWAITING_OPENING_ACK = auto()
+    AWAITING_READINESS = auto()
     AWAITING_ANSWER = auto()
     AWAITING_PROPOSAL = auto()
     AWAITING_FEEDBACK = auto()
@@ -33,6 +43,9 @@ class ReplyKind(Enum):
 
 
 class UtteranceKind(Enum):
+    GREETING = auto()
+    READINESS = auto()
+    OPENING_WAIT = auto()
     QUESTION = auto()
     FOLLOW_UP = auto()
     NUDGE = auto()
@@ -75,6 +88,9 @@ class InterviewController:
         self._closing_remarks: list[str] = []
         self._follow_ups = [0] * len(QUESTIONS)
         self._clarifications = [0] * len(QUESTIONS)
+        self._greeting_response = ""
+        self._opening_repeats = {Stage.AWAITING_GREETING: 0, Stage.AWAITING_READINESS: 0}
+        self._readiness_nudges = 0
 
     @property
     def stage(self) -> Stage:
@@ -105,6 +121,10 @@ class InterviewController:
         return tuple(self._closing_remarks)
 
     @property
+    def greeting_response(self) -> str:
+        return self._greeting_response
+
+    @property
     def remaining_follow_ups(self) -> int:
         if self._question_index < 0:
             return MAX_FOLLOW_UPS_PER_QUESTION
@@ -118,7 +138,61 @@ class InterviewController:
 
     def start(self) -> Utterance:
         self._require(Stage.NEW)
-        return self._prepare(UtteranceKind.QUESTION, QUESTIONS[0], 0)
+        return self._prepare(UtteranceKind.GREETING, GREETING, None)
+
+    def submit_greeting(self, text: str) -> Utterance | None:
+        self._require(Stage.AWAITING_GREETING)
+        response = text.strip()
+        if not response:
+            return self.request_opening_repeat()
+        self._greeting_response = response
+        self._stage = Stage.AWAITING_OPENING_ACK
+        return None
+
+    def add_greeting_continuation(self, text: str) -> None:
+        self._require(Stage.AWAITING_OPENING_ACK)
+        if continuation := text.strip():
+            self._greeting_response = f"{self._greeting_response} {continuation}"
+
+    def prepare_readiness(self, acknowledgement: str) -> Utterance:
+        self._require(Stage.AWAITING_OPENING_ACK)
+        acknowledgement = acknowledgement.strip()
+        body = acknowledgement.rstrip(".! ")
+        if (
+            not body
+            or len(acknowledgement) > 120
+            or "\n" in acknowledgement
+            or "?" in acknowledgement
+            or "." in body
+            or "!" in body
+        ):
+            raise ValueError("Opening acknowledgement must be one short spoken line")
+        if acknowledgement[-1] not in ".!?":
+            acknowledgement += "."
+        return self._prepare(UtteranceKind.READINESS, f"{acknowledgement} {READINESS_PROMPT}", None)
+
+    def submit_readiness(self, ready: bool) -> Utterance | None:
+        self._require(Stage.AWAITING_READINESS)
+        if ready:
+            return self._prepare(UtteranceKind.QUESTION, QUESTIONS[0], 0)
+        if self._readiness_nudges >= 1:
+            return None
+        self._readiness_nudges += 1
+        return self._prepare(UtteranceKind.OPENING_WAIT, READINESS_WAIT, None)
+
+    def request_opening_repeat(self) -> Utterance:
+        phase = (
+            Stage.AWAITING_GREETING if self._stage is Stage.AWAITING_OPENING_ACK else self._stage
+        )
+        if phase not in self._opening_repeats:
+            raise InvalidTransition("There is no opening prompt to repeat")
+        if self._opening_repeats[phase] >= MAX_OPENING_REPEATS:
+            raise LimitReached("Opening repeat limit reached")
+        self._opening_repeats[phase] += 1
+        if phase is Stage.AWAITING_GREETING:
+            self._greeting_response = ""
+            return self._prepare(UtteranceKind.GREETING, GREETING, None)
+        return self._prepare(UtteranceKind.READINESS, READINESS_PROMPT, None)
 
     def submit_answer(self, text: str) -> Utterance | None:
         """Record a candidate turn; an empty turn requests one bounded repeat."""
@@ -257,7 +331,11 @@ class InterviewController:
         if utterance is None or utterance.id != utterance_id:
             return False
         self._pending = None
-        if utterance.kind is UtteranceKind.QUESTION:
+        if utterance.kind is UtteranceKind.GREETING:
+            self._stage = Stage.AWAITING_GREETING
+        elif utterance.kind in {UtteranceKind.READINESS, UtteranceKind.OPENING_WAIT}:
+            self._stage = Stage.AWAITING_READINESS
+        elif utterance.kind is UtteranceKind.QUESTION:
             if utterance.question_number is None:
                 raise RuntimeError("Question utterance has no question number")
             self._question_index = utterance.question_number - 1
@@ -301,7 +379,12 @@ class InterviewController:
         answer = text.strip()
         if not answer:
             return False
-        if interrupted.kind is UtteranceKind.FEEDBACK:
+        if interrupted.kind is UtteranceKind.GREETING:
+            self._greeting_response = answer
+            self._stage = Stage.AWAITING_OPENING_ACK
+        elif interrupted.kind in {UtteranceKind.READINESS, UtteranceKind.OPENING_WAIT}:
+            self._stage = Stage.AWAITING_READINESS
+        elif interrupted.kind is UtteranceKind.FEEDBACK:
             self._closing_remarks.append(answer)
             self._stage = Stage.AWAITING_FEEDBACK
         else:

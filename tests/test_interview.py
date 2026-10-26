@@ -17,15 +17,22 @@ def deliver(controller: InterviewController, utterance: Utterance) -> None:
     assert controller.delivery_finished(utterance.id)
 
 
+def begin_questions(controller: InterviewController) -> Utterance:
+    deliver(controller, controller.start())
+    controller.submit_greeting("I'm doing well")
+    deliver(controller, controller.prepare_readiness("Good to hear."))
+    return controller.submit_readiness(True)
+
+
 def start_and_answer(
     controller: InterviewController, answer: str = "A real project answer"
 ) -> None:
-    deliver(controller, controller.start())
+    deliver(controller, begin_questions(controller))
     assert controller.submit_answer(answer) is None
 
 
 def reach_feedback(controller: InterviewController) -> None:
-    question = controller.start()
+    question = begin_questions(controller)
     for index, expected in enumerate(QUESTIONS):
         assert question.text == expected
         assert question.question_number == index + 1
@@ -82,7 +89,7 @@ def test_clarification_and_repeat_share_one_slot() -> None:
     assert controller.propose(ReplyKind.ADVANCE).text == QUESTIONS[1]
 
     another = InterviewController()
-    deliver(another, another.start())
+    deliver(another, begin_questions(another))
     repeated = another.request_repeat()
     assert repeated.text == QUESTIONS[0]
     deliver(another, repeated)
@@ -93,7 +100,7 @@ def test_clarification_and_repeat_share_one_slot() -> None:
 
 def test_empty_answer_and_repeat_request_are_bounded() -> None:
     controller = InterviewController()
-    deliver(controller, controller.start())
+    deliver(controller, begin_questions(controller))
     repeated = controller.submit_answer("  ")
     assert repeated.kind is UtteranceKind.REPEAT
     assert repeated.text == QUESTIONS[0]
@@ -110,7 +117,7 @@ def test_empty_answer_and_repeat_request_are_bounded() -> None:
 
 def test_interrupted_main_question_needs_new_delivery() -> None:
     controller = InterviewController()
-    original = controller.start()
+    original = begin_questions(controller)
     assert controller.current_question is None
     assert controller.interrupt(original.id)
     assert controller.pending is None
@@ -172,7 +179,7 @@ def test_interrupted_closing_response_does_not_complete() -> None:
 
 def test_substantive_barge_in_resolves_interrupted_main_question() -> None:
     controller = InterviewController()
-    first = controller.start()
+    first = begin_questions(controller)
     assert controller.interrupt(first.id)
     assert controller.accept_barge_in_answer("I built a parser")
     assert controller.current_question_number == 1
@@ -205,7 +212,7 @@ def test_interrupted_feedback_can_be_replanned_but_not_marked_complete() -> None
 
 def test_duplicate_and_stale_delivery_and_interruption_events_are_ignored() -> None:
     controller = InterviewController()
-    first = controller.start()
+    first = begin_questions(controller)
     assert not controller.delivery_finished(first.id + 100)
     deliver(controller, first)
     assert not controller.delivery_finished(first.id)
@@ -270,7 +277,7 @@ def test_early_end_is_distinct_and_blocks_further_questions() -> None:
 
 def test_skip_interrupted_question_is_explicit_and_does_not_record_answer() -> None:
     controller = InterviewController()
-    first = controller.start()
+    first = begin_questions(controller)
     assert controller.interrupt(first.id)
     second = controller.skip_interrupted()
     assert second.text == QUESTIONS[1]

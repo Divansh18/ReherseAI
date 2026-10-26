@@ -39,6 +39,15 @@ def finish_output(session, context):
     session.bot_stopped()
 
 
+async def start_questions(session):
+    await session.start()
+    finish_output(session, begin_output(session))
+    session.controller.submit_greeting("I'm doing well")
+    await session._queue_speech(session.controller.prepare_readiness("Good to hear."))
+    finish_output(session, begin_output(session))
+    await session._queue_speech(session.controller.submit_readiness(True))
+
+
 def events(log):
     return [json.loads(line) for line in log.path.read_text().splitlines()]
 
@@ -107,7 +116,7 @@ async def test_spoken_stop_during_answer_ends_without_unasked_feedback(tmp_path)
 
     log = SessionLog(tmp_path, "stop-answer")
     session = InterviewSession(log, infer, speak, lambda _: None)
-    await session.start()
+    await start_questions(session)
     finish_output(session, begin_output(session))
     await session.user_started()
     await session.user_stopped("Can we end the interview?")
@@ -119,7 +128,7 @@ async def test_spoken_stop_during_answer_ends_without_unasked_feedback(tmp_path)
     assert session.controller.stage is Stage.ENDED_EARLY
     await session.user_started()
     await session.user_stopped("More answers")
-    assert len(spoken) == 2
+    assert len(spoken) == 4
     await session.close()
     assert events(log)[-1]["session_end_kind"] == "spoken_early_end"
 
@@ -141,7 +150,7 @@ async def test_explicit_stop_phrasings_are_not_inferred_as_answers(tmp_path, spo
         pass
 
     session = InterviewSession(SessionLog(tmp_path, "stop-phrasing"), infer, speak, lambda _: None)
-    await session.start()
+    await start_questions(session)
     finish_output(session, begin_output(session))
     await session.user_started()
     await session.user_stopped(spoken_request)
@@ -183,7 +192,7 @@ async def test_spoken_stop_segments_enter_early_closing_before_turn_completion(t
         log, infer, input_adapter.speak, lambda _: None, cancel_audio=cancel_audio
     )
     input_adapter.session = session
-    await session.start()
+    await start_questions(session)
     finish_output(session, begin_output(session))
 
     await input_adapter.process_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
@@ -230,7 +239,7 @@ async def test_non_requests_reach_answer_route_without_early_end(tmp_path, speec
     log = SessionLog(tmp_path, "not-a-stop")
     session = InterviewSession(log, infer, input_adapter.speak, lambda _: None)
     input_adapter.session = session
-    await session.start()
+    await start_questions(session)
     finish_output(session, begin_output(session))
     await feed_turn(input_adapter, [speech])
     await settle()
@@ -262,7 +271,7 @@ async def test_stop_invalidates_pending_next_question_before_it_can_play(tmp_pat
         log, infer, input_adapter.speak, lambda _: None, cancel_audio=cancel_audio
     )
     input_adapter.session = session
-    await session.start()
+    await start_questions(session)
     finish_output(session, begin_output(session))
     await feed_turn(input_adapter, ["I built an API"])
     await settle()
@@ -314,7 +323,7 @@ async def test_latest_stop_request_cancels_pending_question_and_latches(tmp_path
     log = SessionLog(tmp_path, "wanna-stop")
     session = InterviewSession(log, infer, speak, lambda _: None)
     input_adapter.session = session
-    await session.start()
+    await start_questions(session)
     finish_output(session, begin_output(session))
     await feed_turn(input_adapter, ["I built an API"])
     await settle()
@@ -372,7 +381,7 @@ async def test_withdrawal_in_noisy_segmented_answer_bypasses_decision(tmp_path):
     log = SessionLog(tmp_path, "withdrawal")
     session = InterviewSession(log, infer, input_adapter.speak, lambda _: None)
     input_adapter.session = session
-    await session.start()
+    await start_questions(session)
     finish_output(session, begin_output(session))
     await feed_turn(input_adapter, ["I built an API"])
     await settle()
@@ -425,7 +434,7 @@ async def test_stop_latch_discards_cancellation_resistant_decision(tmp_path):
     log = SessionLog(tmp_path, "late-decision")
     session = InterviewSession(log, infer, input_adapter.speak, lambda _: None)
     input_adapter.session = session
-    await session.start()
+    await start_questions(session)
     finish_output(session, begin_output(session))
     await feed_turn(input_adapter, ["I built an API"])
     await decision_started.wait()
@@ -451,13 +460,16 @@ async def test_speech_before_first_output_retries_unheard_question(tmp_path):
     log = SessionLog(tmp_path, "startup")
     session = InterviewSession(log, infer, input_adapter.speak, lambda _: None)
     input_adapter.session = session
-    await session.start()
+    await start_questions(session)
     first_id = session.controller.pending.id
     await feed_turn(input_adapter, ["I am proud of a project I built."])
     assert session.controller.answers == ((), (), (), ())
     assert session.controller.pending.id != first_id
     assert session.controller.pending.text == QUESTIONS[0]
-    assert not any(row["event"] == "agent_output_started" for row in events(log))
+    assert not any(
+        row["event"] == "agent_output_started" and row["utterance_id"] == first_id
+        for row in events(log)
+    )
     await session.close()
 
 
@@ -470,7 +482,7 @@ async def test_cancel_between_utterance_marker_and_tts_discards_question(tmp_pat
 
     async def push(frame, _direction=FrameDirection.DOWNSTREAM):
         frames.append(frame)
-        if isinstance(frame, UtteranceMarkerFrame) and frame.utterance_id == 2:
+        if isinstance(frame, UtteranceMarkerFrame) and frame.utterance_id == 4:
             marker_sent.set()
             try:
                 await release_marker.wait()
@@ -488,7 +500,7 @@ async def test_cancel_between_utterance_marker_and_tts_discards_question(tmp_pat
         SessionLog(tmp_path, "tts-race"), infer, input_adapter.speak, lambda _: None
     )
     input_adapter.session = session
-    await session.start()
+    await start_questions(session)
     finish_output(session, begin_output(session))
     await session.user_started()
     await session.user_stopped("I built an API")
@@ -521,7 +533,7 @@ async def test_decision_receives_complete_accumulated_answer_after_nudge(tmp_pat
         SessionLog(tmp_path, "complete-answer"), infer, input_adapter.speak, lambda _: None
     )
     input_adapter.session = session
-    await session.start()
+    await start_questions(session)
     finish_output(session, begin_output(session))
     await feed_turn(input_adapter, ["I'm proud of a first-semester project."])
     await settle()
@@ -566,7 +578,7 @@ async def test_spoken_stop_cancels_inference_and_uses_only_collected_answer(tmp_
 
     log = SessionLog(tmp_path, "stop-inference")
     session = InterviewSession(log, infer, speak, lambda _: None, cancel_audio=cancel_audio)
-    await session.start()
+    await start_questions(session)
     finish_output(session, begin_output(session))
     await session.user_started()
     await session.user_stopped("I built a parser")
@@ -599,7 +611,7 @@ async def test_stop_during_prepared_agent_output_discards_unplayed_text(tmp_path
 
     log = SessionLog(tmp_path, "stop-output")
     session = InterviewSession(log, infer, speak, lambda _: None)
-    await session.start()
+    await start_questions(session)
     finish_output(session, begin_output(session))
     await session.user_started()
     await session.user_stopped("I built a parser")
@@ -637,7 +649,7 @@ async def test_unheard_next_question_routes_continuation_to_previous_answer(tmp_
         spoken.append(utterance)
 
     session = InterviewSession(SessionLog(tmp_path, "unheard"), infer, speak, lambda _: None)
-    await session.start()
+    await start_questions(session)
     finish_output(session, begin_output(session))
     await session.user_started()
     await session.user_stopped("I built an interview API")
@@ -671,7 +683,7 @@ async def test_barge_in_during_playback_and_late_stop_do_not_deliver(tmp_path):
 
     log = SessionLog(tmp_path, "barge-late")
     session = InterviewSession(log, infer, speak, lambda _: None)
-    await session.start()
+    await start_questions(session)
     interrupted = spoken[-1]
     context = begin_output(session)
     await session.user_started()
@@ -703,7 +715,7 @@ async def test_question_two_payload_and_prompt_keep_follow_up_on_technical_chall
         spoken.append(utterance)
 
     session = InterviewSession(SessionLog(tmp_path, "q2"), infer, speak, lambda _: None)
-    await session.start()
+    await start_questions(session)
     finish_output(session, begin_output(session))
     await session.user_started()
     await session.user_stopped("I built a scheduling API")

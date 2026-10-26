@@ -50,6 +50,15 @@ def begin_output(session):
     session.bot_started()
 
 
+async def start_questions(session):
+    await session.start()
+    deliver(session)
+    session.controller.submit_greeting("I'm doing well")
+    await session._queue_speech(session.controller.prepare_readiness("Good to hear."))
+    deliver(session)
+    await session._queue_speech(session.controller.submit_readiness(True))
+
+
 async def settle():
     await asyncio.sleep(0)
     await asyncio.sleep(0)
@@ -58,7 +67,7 @@ async def settle():
 @pytest.mark.asyncio
 async def test_full_mocked_session_and_log(harness):
     session, spoken, published, decisions = harness
-    await session.start()
+    await start_questions(session)
     for number, question in enumerate(QUESTIONS, start=1):
         assert spoken[-1].text == question
         deliver(session)
@@ -94,7 +103,7 @@ async def test_barge_in_cancels_obsolete_inference_and_keeps_answer(tmp_path):
         spoken.append(utterance)
 
     session = InterviewSession(SessionLog(tmp_path, "cancel"), infer, speak, lambda _: None)
-    await session.start()
+    await start_questions(session)
     deliver(session)
     await session.user_started()
     await session.user_stopped("I built a compiler")
@@ -104,14 +113,14 @@ async def test_barge_in_cancels_obsolete_inference_and_keeps_answer(tmp_path):
     assert pending.cancelling()
     await session.user_stopped("and measured its compile time")
     assert session.controller.answers[0] == ("I built a compiler and measured its compile time",)
-    assert len(spoken) == 1
+    assert len(spoken) == 3  # Greeting, readiness, and question one only.
     await session.close()
 
 
 @pytest.mark.asyncio
 async def test_interrupted_question_accepts_answer_without_stale_delivery(harness):
     session, spoken, published, _decisions = harness
-    await session.start()
+    await start_questions(session)
     original = spoken[-1]
     begin_output(session)
     await session.user_started()
@@ -129,7 +138,7 @@ async def test_interrupted_question_accepts_answer_without_stale_delivery(harnes
 @pytest.mark.asyncio
 async def test_empty_barge_in_retries_with_new_id(harness):
     session, spoken, _published, _decisions = harness
-    await session.start()
+    await start_questions(session)
     first = spoken[-1]
     await session.user_started()
     await session.user_stopped("")

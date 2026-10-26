@@ -25,6 +25,15 @@ def deliver(session):
     session.bot_stopped()
 
 
+async def start_questions(session):
+    await session.start()
+    deliver(session)
+    session.controller.submit_greeting("I'm doing well")
+    await session._queue_speech(session.controller.prepare_readiness("Good to hear."))
+    deliver(session)
+    await session._queue_speech(session.controller.submit_readiness(True))
+
+
 def begin_output(session):
     utterance = session.controller.pending
     context = f"context-{utterance.id}"
@@ -62,7 +71,7 @@ async def test_multiple_final_stt_segments_one_turn_and_one_decision(tmp_path):
     log = SessionLog(tmp_path, "segments")
     session = InterviewSession(log, infer, input_adapter.speak, lambda _: None)
     input_adapter.session = session
-    await session.start()
+    await start_questions(session)
     deliver(session)
 
     # Pipecat can forward a final STT segment before emitting the turn-start frame.
@@ -114,7 +123,7 @@ async def test_fragment_after_follow_up_waits_for_continuation(tmp_path):
         spoken.append(utterance)
 
     session = InterviewSession(SessionLog(tmp_path, "fragment"), infer, speak, lambda _: None)
-    await session.start()
+    await start_questions(session)
     deliver(session)
     await session.user_started()
     await session.user_stopped("I built an interview API")
@@ -126,7 +135,7 @@ async def test_fragment_after_follow_up_waits_for_continuation(tmp_path):
     await session.user_stopped("So the idea", segment_count=1)
     await settle()
     assert session.controller.stage is Stage.AWAITING_PROPOSAL
-    assert len(spoken) == 2
+    assert len(spoken) == 4
 
     await session.user_started()
     await session.user_stopped("was to schedule interviews using Python", segment_count=1)
@@ -158,7 +167,7 @@ async def test_spent_follow_up_does_not_force_advance(tmp_path):
         spoken.append(utterance)
 
     session = InterviewSession(SessionLog(tmp_path, "limit"), infer, speak, lambda _: None)
-    await session.start()
+    await start_questions(session)
     deliver(session)
     await session.user_started()
     await session.user_stopped("I built an API")
@@ -169,7 +178,7 @@ async def test_spent_follow_up_does_not_force_advance(tmp_path):
     await settle()
 
     assert session.controller.stage is Stage.AWAITING_PROPOSAL
-    assert len(spoken) == 2
+    assert len(spoken) == 4
     await session.user_started()
     await session.user_stopped("was to connect candidates to interviewers")
     await settle()
@@ -191,7 +200,7 @@ async def test_barge_in_joins_several_segments_before_inference(tmp_path):
         SessionLog(tmp_path, "barge-segments"), infer, input_adapter.speak, lambda _: None
     )
     input_adapter.session = session
-    await session.start()
+    await start_questions(session)
     begin_output(session)
     for frame in (
         UserStartedSpeakingFrame(),
@@ -229,7 +238,7 @@ async def test_stale_llm_result_after_continuation_cannot_advance(tmp_path):
         spoken.append(utterance)
 
     session = InterviewSession(SessionLog(tmp_path, "stale"), infer, speak, lambda _: None)
-    await session.start()
+    await start_questions(session)
     deliver(session)
     await session.user_started()
     await session.user_stopped("I built an API")
@@ -240,6 +249,6 @@ async def test_stale_llm_result_after_continuation_cannot_advance(tmp_path):
     release_old.set()
     await settle()
     assert session.controller.stage is Stage.AWAITING_PROPOSAL
-    assert len(spoken) == 1
+    assert len(spoken) == 3
     assert session.controller.answers[0] == ("I built an API and owned its deployment",)
     await session.close()
