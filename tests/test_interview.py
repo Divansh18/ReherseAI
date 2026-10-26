@@ -253,6 +253,33 @@ def test_invalid_proposals_do_not_change_state() -> None:
     assert controller.propose(ReplyKind.ADVANCE).text == QUESTIONS[1]
 
 
+def test_early_end_is_distinct_and_blocks_further_questions() -> None:
+    controller = InterviewController()
+    first = controller.start()
+    assert controller.end_early()
+    assert not controller.delivery_finished(first.id)
+    closing = controller.prepare_early_feedback("We'll stop here. Thanks for practicing.")
+    deliver(controller, closing)
+    assert controller.stage is Stage.ENDED_EARLY
+    assert not controller.end_early()
+    with pytest.raises(InvalidTransition):
+        controller.submit_answer("A late answer")
+    with pytest.raises(InvalidTransition):
+        controller.propose(ReplyKind.ADVANCE)
+
+
+def test_skip_interrupted_question_is_explicit_and_does_not_record_answer() -> None:
+    controller = InterviewController()
+    first = controller.start()
+    assert controller.interrupt(first.id)
+    second = controller.skip_interrupted()
+    assert second.text == QUESTIONS[1]
+    assert controller.answers == ((), (), (), ())
+    assert controller.current_question_number == 1
+    deliver(controller, second)
+    assert controller.current_question_number == 2
+
+
 def test_feedback_must_be_two_or_three_actual_lines() -> None:
     controller = InterviewController()
     reach_feedback(controller)

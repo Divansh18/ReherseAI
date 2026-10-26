@@ -20,7 +20,9 @@ class Stage(Enum):
     AWAITING_ANSWER = auto()
     AWAITING_PROPOSAL = auto()
     AWAITING_FEEDBACK = auto()
+    EARLY_CLOSING = auto()
     COMPLETE = auto()
+    ENDED_EARLY = auto()
 
 
 class ReplyKind(Enum):
@@ -37,6 +39,7 @@ class UtteranceKind(Enum):
     CLARIFICATION = auto()
     REPEAT = auto()
     FEEDBACK = auto()
+    EARLY_FEEDBACK = auto()
 
 
 @dataclass(frozen=True)
@@ -174,6 +177,80 @@ class InterviewController:
             raise ValueError("Closing feedback must have 2 or 3 nonempty lines")
         return self._prepare(UtteranceKind.FEEDBACK, text, None)
 
+    def end_early(self) -> bool:
+        """Stop all question progression, including an undelivered question."""
+        if self._stage in {Stage.COMPLETE, Stage.ENDED_EARLY, Stage.EARLY_CLOSING}:
+            return False
+        self._pending = None
+        self._interrupted = None
+        self._stage = Stage.EARLY_CLOSING
+        return True
+
+    def prepare_early_feedback(self, text: str) -> Utterance:
+        self._require(Stage.EARLY_CLOSING)
+        lines = text.splitlines()
+        if not 1 <= len(lines) <= 2 or any(not line.strip() for line in lines):
+            raise ValueError("Early closing must have 1 or 2 nonempty lines")
+        return self._prepare(UtteranceKind.EARLY_FEEDBACK, text, None)
+
+    def skip_current(self) -> Utterance | None:
+        """Advance on an explicit skip without recording a fabricated answer."""
+        self._require(Stage.AWAITING_ANSWER)
+        if self._question_index == len(QUESTIONS) - 1:
+            self._stage = Stage.AWAITING_FEEDBACK
+            return None
+        return self._prepare(
+            UtteranceKind.QUESTION, QUESTIONS[self._question_index + 1], self._question_index + 1
+        )
+
+    def skip_interrupted(self) -> Utterance | None:
+        """Apply an explicit skip during interrupted question speech."""
+        self._require(Stage.DELIVERING)
+        interrupted = self._interrupted
+        if interrupted is None or interrupted.question_number is None:
+            raise InvalidTransition("There is no interrupted question to skip")
+        if interrupted.kind is UtteranceKind.QUESTION:
+            self._question_index = interrupted.question_number - 1
+        self._interrupted = None
+        self._stage = Stage.AWAITING_ANSWER
+        return self.skip_current()
+
+    def resolve_unheard_question(self, text: str) -> Utterance:
+        """Route barge-in before audio to the previously delivered question."""
+        self._require(Stage.DELIVERING)
+        interrupted = self._interrupted
+        if interrupted is None or interrupted.kind is not UtteranceKind.QUESTION:
+            raise InvalidTransition("There is no interrupted main question")
+        self._interrupted = None
+        if self._question_index < 0:
+            return self._prepare(UtteranceKind.QUESTION, interrupted.text, 0)
+        answer = text.strip()
+        if answer:
+            previous = self._answers[self._question_index]
+            if previous:
+                previous[-1] = f"{previous[-1]} {answer}"
+            else:
+                previous.append(answer)
+        return self._prepare(
+            UtteranceKind.QUESTION, interrupted.text, interrupted.question_number - 1
+        )
+
+    def resolve_unheard_follow_up(self, text: str) -> Utterance:
+        """Preserve the earlier answer; an unheard extra prompt cannot consume a reply."""
+        self._require(Stage.DELIVERING)
+        interrupted = self._interrupted
+        if interrupted is None or interrupted.kind not in {
+            UtteranceKind.FOLLOW_UP,
+            UtteranceKind.NUDGE,
+            UtteranceKind.CLARIFICATION,
+            UtteranceKind.REPEAT,
+        }:
+            raise InvalidTransition("There is no interrupted extra prompt")
+        if text.strip() and self._answers[self._question_index]:
+            answers = self._answers[self._question_index]
+            answers[-1] = f"{answers[-1]} {text.strip()}"
+        return self.retry_interrupted()
+
     def delivery_finished(self, utterance_id: int) -> bool:
         """Apply only the current pending delivery; ignore duplicate or stale IDs."""
         utterance = self._pending
@@ -187,6 +264,8 @@ class InterviewController:
             self._stage = Stage.AWAITING_ANSWER
         elif utterance.kind is UtteranceKind.FEEDBACK:
             self._stage = Stage.COMPLETE
+        elif utterance.kind is UtteranceKind.EARLY_FEEDBACK:
+            self._stage = Stage.ENDED_EARLY
         else:
             self._stage = Stage.AWAITING_ANSWER
         return True

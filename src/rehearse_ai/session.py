@@ -18,11 +18,22 @@ from rehearse_ai.session_log import SessionLog
 Infer = Callable[[str, dict[str, Any]], Awaitable[Mapping[str, Any]]]
 Speak = Callable[[Utterance], Awaitable[None]]
 Publish = Callable[[dict[str, Any]], None]
+CancelAudio = Callable[[], Awaitable[None]]
 
 _REPEAT = re.compile(
     r"^(?:please\s+)?(?:can you\s+|could you\s+|would you\s+)?"
     r"(?:repeat(?: the (?:question|last question))?|say (?:that|the question) again)\??[.!]?$",
     re.IGNORECASE,
+)
+_SKIP = re.compile(r"^(?:please\s+)?(?:skip(?: this question)?|next question)\??[.!]?$", re.I)
+_END = re.compile(
+    r"(?:^|[.!?]\s*)(?:but\s+)?"
+    r"(?:(?:can|could|may)\s+we\s+|i\s+(?:want|would like|need)\s+to\s+|"
+    r"i'd\s+like\s+to\s+|let's\s+|please\s+)?"
+    r"(?:end|stop|finish|quit|exit|wrap up)"
+    r"(?:\s+(?:(?:the|this|our)\s+)?(?:interview|session|practice)|\s+(?:now|here|it))?"
+    r"[?.!]*$|\b(?:i'm|i am|we're|we are)\s+(?:done|finished)[?.!]*$",
+    re.I,
 )
 
 
@@ -35,16 +46,25 @@ class InterviewSession:
         publish: Publish,
         *,
         turn_pause_secs: float = 1.1,
+        cancel_audio: CancelAudio | None = None,
     ) -> None:
         self.controller = InterviewController()
         self.log = log
         self._infer = infer
         self._speak = speak
         self._publish = publish
+        self._cancel_audio = cancel_audio
         self._response_task: asyncio.Task[None] | None = None
         self._generation = 0
         self._speaking_id: int | None = None
         self._active_prompt_id: int | None = None
+        self._last_delivered_prompt: Utterance | None = None
+        self._output_started_ids: set[int] = set()
+        self._tts_completed_ids: set[int] = set()
+        self._tts_contexts: dict[str, int] = {}
+        self._first_audio_ids: set[int] = set()
+        self._interrupted_output_id: int | None = None
+        self._cancelled_output_stop_debt = 0
         self._last_turn_end: float | None = None
         self._turn_started_at: float | None = None
         self._turn_number = 0
@@ -94,6 +114,12 @@ class InterviewSession:
             interrupted=False,
             question_number=utterance.question_number,
             utterance_kind=utterance.kind.name.lower(),
+            generation=self._generation,
+            spoken=False,
+            browser_playback_onset_ms=None,
+        )
+        self._record(
+            "tts_requested", speaker=None, utterance_id=utterance.id, generation=self._generation
         )
         await self._speak(utterance)
 
@@ -110,13 +136,32 @@ class InterviewSession:
         self._response_task = None
         pending = self.controller.pending
         if pending is not None and self.controller.interrupt(pending.id):
+            self._interrupted_output_id = (
+                pending.id if pending.id in self._output_started_ids else None
+            )
+            if self._interrupted_output_id is not None:
+                self._cancelled_output_stop_debt += 1
             self._speaking_id = None
+            self._tts_contexts = {
+                context: identifier
+                for context, identifier in self._tts_contexts.items()
+                if identifier != pending.id
+            }
             self._record(
                 "agent_interrupted",
                 speaker="agent",
                 utterance_id=pending.id,
                 text=pending.text,
                 interrupted=True,
+                output_started=self._interrupted_output_id is not None,
+                cancellation_reason="candidate_speech_onset",
+                generation=self._generation - 1,
+            )
+            self._record(
+                "agent_cancellation",
+                speaker=None,
+                utterance_id=pending.id,
+                generation=self._generation - 1,
             )
         self._turn_number += 1
         self._turn_started_at = time.perf_counter()
@@ -134,7 +179,7 @@ class InterviewSession:
         segment_count: int | None = None,
         boundary_frame_id: int | None = None,
     ) -> None:
-        if self._closed or self.controller.stage is Stage.COMPLETE:
+        if self._closed or self.controller.stage in {Stage.COMPLETE, Stage.ENDED_EARLY}:
             return
         answer = text.strip()
         self._last_turn_end = time.perf_counter()
@@ -159,28 +204,88 @@ class InterviewSession:
             boundary="Pipecat UserStoppedSpeakingFrame",
             boundary_frame_id=boundary_frame_id,
             configured_pause_secs=self._turn_pause_secs,
+            speech_end_estimate="Pipecat VAD stop before speech-timeout boundary",
+        )
+        self._record(
+            "candidate_turn_completed",
+            speaker="candidate",
+            turn_number=self._turn_number,
+            boundary_frame_id=boundary_frame_id,
+            boundary_method="Pipecat SpeechTimeoutUserTurnStopStrategy",
+            configured_pause_secs=self._turn_pause_secs,
         )
         self._turn_started_at = None
 
+        if _END.search(answer) and self.controller.stage is not Stage.EARLY_CLOSING:
+            await self._end_early(answer)
+            return
+        if self.controller.stage is Stage.EARLY_CLOSING:
+            if any(self.controller.answers):
+                self._start_response()
+            else:
+                await self._queue_speech(
+                    self.controller.prepare_early_feedback("We'll end here. Thanks for practicing.")
+                )
+            return
+
+        if _SKIP.fullmatch(answer) and self.controller.interrupted_utterance is not None:
+            try:
+                utterance = self.controller.skip_interrupted()
+            except ValueError:
+                return
+            self._record("candidate_skipped_question", speaker="candidate")
+            if utterance is not None:
+                await self._queue_speech(utterance)
+            else:
+                self._start_response()
+            return
+
         interrupted = self.controller.interrupted_utterance
         if interrupted is not None:
+            if interrupted.kind.name == "EARLY_FEEDBACK":
+                await self._queue_speech(self.controller.retry_interrupted())
+                return
             if not answer or _REPEAT.fullmatch(answer):
                 await self._queue_speech(self.controller.retry_interrupted())
                 return
-            self.controller.accept_barge_in_answer(answer)
-            self._record("barge_in_answer_accepted", speaker="candidate", text=answer)
+            if self._interrupted_output_id != interrupted.id:
+                self._record(
+                    "unheard_prompt_recovery",
+                    speaker=None,
+                    utterance_id=interrupted.id,
+                    candidate_text=answer,
+                )
+                if interrupted.kind.name == "QUESTION":
+                    retry = self.controller.resolve_unheard_question(answer)
+                    await self._queue_speech(retry)
+                    return
+                elif interrupted.kind.name in {"FOLLOW_UP", "NUDGE", "CLARIFICATION", "REPEAT"}:
+                    await self._queue_speech(self.controller.resolve_unheard_follow_up(answer))
+                    return
+                else:
+                    await self._queue_speech(self.controller.retry_interrupted())
+                    return
+            else:
+                self.controller.accept_barge_in_answer(answer)
+                self._record("barge_in_answer_accepted", speaker="candidate", text=answer)
+            self._interrupted_output_id = None
         elif self.controller.stage is Stage.AWAITING_ANSWER:
             try:
-                utterance = (
-                    self.controller.request_repeat()
-                    if _REPEAT.fullmatch(answer)
-                    else self.controller.submit_answer(answer)
-                )
+                if _SKIP.fullmatch(answer):
+                    utterance = self.controller.skip_current()
+                    self._record("candidate_skipped_question", speaker="candidate")
+                elif _REPEAT.fullmatch(answer):
+                    utterance = self.controller.request_repeat()
+                else:
+                    utterance = self.controller.submit_answer(answer)
             except LimitReached:
                 self._record("clarification_limit", speaker=None)
                 return
             if utterance is not None:
                 await self._queue_speech(utterance)
+                return
+            if _SKIP.fullmatch(answer):
+                self._start_response()
                 return
         elif self.controller.stage is Stage.AWAITING_PROPOSAL:
             if not answer:
@@ -195,16 +300,60 @@ class InterviewSession:
 
         self._start_response()
 
+    async def _end_early(self, request: str) -> None:
+        self._generation += 1
+        task = self._response_task
+        if task and not task.done():
+            task.cancel()
+        self._response_task = None
+        pending = self.controller.pending
+        if self.controller.end_early():
+            self._speaking_id = None
+            self._record(
+                "early_end_requested",
+                speaker="candidate",
+                text=request,
+                utterance_id=pending.id if pending else None,
+            )
+            if pending:
+                self._record(
+                    "agent_cancellation",
+                    speaker=None,
+                    utterance_id=pending.id,
+                    cancellation_reason="early_end",
+                )
+            if self._cancel_audio:
+                await self._cancel_audio()
+            if any(self.controller.answers):
+                self._start_response()
+            else:
+                await self._queue_speech(
+                    self.controller.prepare_early_feedback("We'll end here. Thanks for practicing.")
+                )
+
     def _start_response(self) -> None:
         self._generation += 1
         generation = self._generation
         self._response_task = asyncio.create_task(self._respond(generation))
 
     def _payload(self) -> dict[str, Any]:
+        index = self.controller.current_question_number
         return {
             "current_question_number": self.controller.current_question_number,
             "current_question": self.controller.current_question,
             "answers_by_question": [list(turns) for turns in self.controller.answers],
+            "current_question_answers": list(self.controller.answers[index - 1]) if index else [],
+            "last_delivered_prompt": (
+                self._last_delivered_prompt.text if self._last_delivered_prompt else None
+            ),
+            "last_delivered_prompt_id": (
+                self._last_delivered_prompt.id if self._last_delivered_prompt else None
+            ),
+            "interrupted_prompt": (
+                self.controller.interrupted_utterance.text
+                if self.controller.interrupted_utterance
+                else None
+            ),
             "closing_remarks": list(self.controller.closing_remarks),
             "max_extra_prompts_per_question": {"follow_up_or_nudge": 1, "clarification": 1},
             "remaining_follow_ups": self.controller.remaining_follow_ups,
@@ -221,6 +370,8 @@ class InterviewSession:
                     generation=generation,
                     purpose="decision",
                     answer_number=self._answer_number,
+                    llm_first_token_ms=None,
+                    llm_first_token_basis="unavailable from structured run_inference",
                 )
                 result = await self._infer("decision", self._payload())
                 if generation != self._generation or self._closed:
@@ -243,6 +394,7 @@ class InterviewSession:
                     text=text if isinstance(text, str) else None,
                     remaining_follow_ups=self.controller.remaining_follow_ups,
                     remaining_clarifications=self.controller.remaining_clarifications,
+                    validated=True,
                 )
                 if action == "WAIT":
                     self._record(
@@ -276,6 +428,8 @@ class InterviewSession:
                     generation=generation,
                     purpose="feedback",
                     answer_number=self._answer_number,
+                    llm_first_token_ms=None,
+                    llm_first_token_basis="unavailable from structured run_inference",
                 )
                 result = await self._infer("feedback", self._payload())
                 if generation != self._generation or self._closed:
@@ -287,21 +441,94 @@ class InterviewSession:
                     generation=generation,
                     purpose="feedback",
                     duration_ms=round((time.perf_counter() - started_at) * 1000, 1),
+                    validated=True,
                 )
                 lines = result.get("lines")
                 if not isinstance(lines, list) or not all(isinstance(line, str) for line in lines):
                     raise ValueError("Feedback response did not contain lines")
                 await self._queue_speech(self.controller.prepare_feedback("\n".join(lines)))
+
+            if self.controller.stage is Stage.EARLY_CLOSING:
+                self._record(
+                    "inference_started",
+                    speaker=None,
+                    generation=generation,
+                    purpose="early_feedback",
+                    llm_first_token_ms=None,
+                    llm_first_token_basis="unavailable from structured run_inference",
+                )
+                result = await self._infer("early_feedback", self._payload())
+                if generation != self._generation or self._closed:
+                    self._record("inference_stale_discarded", speaker=None, generation=generation)
+                    return
+                lines = result.get("lines")
+                if not isinstance(lines, list) or not all(isinstance(line, str) for line in lines):
+                    raise ValueError("Early feedback response did not contain lines")
+                self._record(
+                    "inference_completed",
+                    speaker=None,
+                    generation=generation,
+                    purpose="early_feedback",
+                    validated=True,
+                )
+                await self._queue_speech(self.controller.prepare_early_feedback("\n".join(lines)))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self._record("response_error", speaker=None, error_type=type(exc).__name__)
+            if self.controller.stage is Stage.EARLY_CLOSING and generation == self._generation:
+                await self._queue_speech(
+                    self.controller.prepare_early_feedback(
+                        "We'll stop here. Thanks for sharing what you have so far."
+                    )
+                )
+
+    def tts_started(self, utterance_id: int, context_id: str | None) -> None:
+        pending = self.controller.pending
+        if pending is None or pending.id != utterance_id or context_id is None:
+            return
+        self._tts_contexts[context_id] = utterance_id
+        self._record(
+            "tts_started", speaker=None, utterance_id=utterance_id, tts_context_id=context_id
+        )
+
+    def tts_first_audio(self, context_id: str | None) -> None:
+        utterance_id = self._tts_contexts.get(context_id or "")
+        pending = self.controller.pending
+        if (
+            utterance_id is not None
+            and pending is not None
+            and pending.id == utterance_id
+            and utterance_id not in self._first_audio_ids
+        ):
+            self._first_audio_ids.add(utterance_id)
+            self._record(
+                "tts_first_audio_generated",
+                speaker=None,
+                utterance_id=utterance_id,
+                tts_context_id=context_id,
+                browser_playback_onset_ms=None,
+            )
+
+    def tts_finished(self, context_id: str | None) -> None:
+        utterance_id = self._tts_contexts.pop(context_id or "", None)
+        if utterance_id is not None:
+            self._tts_completed_ids.add(utterance_id)
+            self._record(
+                "tts_generation_finished",
+                speaker=None,
+                utterance_id=utterance_id,
+                tts_context_id=context_id,
+            )
 
     def bot_started(self) -> None:
         pending = self.controller.pending
         if pending is None or self._closed or self._speaking_id == pending.id:
             return
+        if pending.id not in self._first_audio_ids:
+            return
         self._speaking_id = pending.id
+        self._output_started_ids.add(pending.id)
         elapsed = (
             round((time.perf_counter() - self._last_turn_end) * 1000, 1)
             if self._last_turn_end is not None
@@ -317,14 +544,25 @@ class InterviewSession:
                 if elapsed is not None
                 else None
             ),
+            browser_playback_onset_ms=None,
         )
 
     def bot_stopped(self) -> None:
+        if self._cancelled_output_stop_debt:
+            self._cancelled_output_stop_debt -= 1
+            self._record("cancelled_output_stop_ignored", speaker=None)
+            return
         pending = self.controller.pending
-        if pending is None or pending.id != self._speaking_id or self._closed:
+        if (
+            pending is None
+            or pending.id != self._speaking_id
+            or self._closed
+            or pending.id not in self._tts_completed_ids
+        ):
             return
         self._speaking_id = None
         if self.controller.delivery_finished(pending.id):
+            self._last_delivered_prompt = pending
             self._record(
                 "agent_delivery_reported",
                 speaker="agent",
@@ -336,12 +574,22 @@ class InterviewSession:
             )
             if self.controller.stage is Stage.COMPLETE:
                 self._record("interview_complete", speaker=None)
+            elif self.controller.stage is Stage.ENDED_EARLY:
+                self._record("interview_ended_early", speaker=None)
 
     async def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         self._generation += 1
+        pending = self.controller.pending
+        if pending is not None:
+            self._record(
+                "agent_cancellation",
+                speaker=None,
+                utterance_id=pending.id,
+                cancellation_reason="session_disconnected",
+            )
         task = self._response_task
         if task and not task.done():
             task.cancel()
@@ -349,5 +597,16 @@ class InterviewSession:
                 await task
             except asyncio.CancelledError:
                 pass
-        self._record("session_ended", speaker=None)
+        if self.controller.stage is Stage.COMPLETE:
+            end_kind = "normal_completion"
+        elif self.controller.stage is Stage.ENDED_EARLY:
+            end_kind = "spoken_early_end"
+        else:
+            end_kind = "disconnected_before_completion"
+        self._record(
+            "session_ended",
+            speaker=None,
+            interview_stage=self.controller.stage.name.lower(),
+            session_end_kind=end_kind,
+        )
         self.log.close()

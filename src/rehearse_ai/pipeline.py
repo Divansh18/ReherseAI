@@ -3,6 +3,7 @@
 import json
 import uuid
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -10,9 +11,14 @@ from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
+    DataFrame,
     Frame,
+    InterruptionFrame,
     TranscriptionFrame,
+    TTSAudioRawFrame,
     TTSSpeakFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
     VADUserStartedSpeakingFrame,
@@ -60,6 +66,11 @@ FEEDBACK_SCHEMA = {
 }
 
 
+@dataclass
+class UtteranceMarkerFrame(DataFrame):
+    utterance_id: int
+
+
 class InterviewInput(FrameProcessor):
     """Collect final STT segments within Pipecat's single user-turn boundary."""
 
@@ -70,7 +81,11 @@ class InterviewInput(FrameProcessor):
         self._turn_open = False
 
     async def speak(self, utterance: Utterance) -> None:
+        await self.push_frame(UtteranceMarkerFrame(utterance_id=utterance.id))
         await self.push_frame(TTSSpeakFrame(text=utterance.text, append_to_context=False))
+
+    async def cancel_audio(self) -> None:
+        await self.broadcast_interruption()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -83,7 +98,10 @@ class InterviewInput(FrameProcessor):
                 self.session.turn_signal("vad_started", frame_id=frame.id)
             elif isinstance(frame, VADUserStoppedSpeakingFrame):
                 self.session.turn_signal(
-                    "vad_stopped", frame_id=frame.id, stop_secs=frame.stop_secs
+                    "vad_stopped",
+                    frame_id=frame.id,
+                    stop_secs=frame.stop_secs,
+                    speech_end_basis="Silero VAD stop; estimate, not last audible phoneme",
                 )
             elif isinstance(frame, TranscriptionFrame):
                 if frame.text.strip():
@@ -121,6 +139,34 @@ class DeliveryObserver(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class AudioObserver(FrameProcessor):
+    """Correlate TTS context IDs with the utterance marker before output."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.session: InterviewSession | None = None
+        self._utterance_id: int | None = None
+        self._first_audio: set[str] = set()
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if direction is FrameDirection.DOWNSTREAM and self.session is not None:
+            if isinstance(frame, UtteranceMarkerFrame):
+                self._utterance_id = frame.utterance_id
+                return
+            if isinstance(frame, InterruptionFrame):
+                self._utterance_id = None
+            elif isinstance(frame, TTSStartedFrame) and self._utterance_id is not None:
+                self.session.tts_started(self._utterance_id, frame.context_id)
+            elif isinstance(frame, TTSAudioRawFrame) and frame.context_id not in self._first_audio:
+                if frame.context_id:
+                    self._first_audio.add(frame.context_id)
+                self.session.tts_first_audio(frame.context_id)
+            elif isinstance(frame, TTSStoppedFrame):
+                self.session.tts_finished(frame.context_id)
+        await self.push_frame(frame, direction)
+
+
 def inference_adapter(llm: OpenAILLMService):
     async def infer(kind: str, payload: dict[str, Any]) -> Mapping[str, Any]:
         response = await llm.run_inference(
@@ -152,6 +198,7 @@ class LiveSession:
             settings=OpenAILLMService.Settings(model=settings.llm_model),
         )
         input_adapter = InterviewInput()
+        audio_observer = AudioObserver()
         delivery = DeliveryObserver()
         self.session = InterviewSession(
             self.log,
@@ -159,8 +206,10 @@ class LiveSession:
             input_adapter.speak,
             connection.send_app_message,
             turn_pause_secs=settings.turn_pause_secs,
+            cancel_audio=input_adapter.cancel_audio,
         )
         input_adapter.session = self.session
+        audio_observer.session = self.session
         delivery.session = self.session
         self.pipeline = Pipeline(
             [
@@ -196,6 +245,7 @@ class LiveSession:
                         model=settings.tts_model, voice=settings.tts_voice
                     ),
                 ),
+                audio_observer,
                 transport.output(),
                 delivery,
             ]

@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ class SessionLog:
         self.path = directory / f"{session_id}.jsonl"
         self.session_id = session_id
         self._sequence = 0
+        self._clock_start_ns = time.monotonic_ns()
         descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         self._file = os.fdopen(descriptor, "w", encoding="utf-8")
 
@@ -33,6 +35,8 @@ class SessionLog:
             "session_id": self.session_id,
             "sequence": self._sequence,
             "timestamp_utc": datetime.now(UTC).isoformat(),
+            "session_elapsed_ms": round((time.monotonic_ns() - self._clock_start_ns) / 1e6, 1),
+            "clock_basis": "server monotonic clock; UTC timestamp is wall time",
             "event": event,
             "speaker": speaker,
             "utterance_id": utterance_id,

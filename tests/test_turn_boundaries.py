@@ -15,6 +15,24 @@ from rehearse_ai.session import InterviewSession
 from rehearse_ai.session_log import SessionLog
 
 
+def deliver(session):
+    utterance = session.controller.pending
+    context = f"context-{utterance.id}"
+    session.tts_started(utterance.id, context)
+    session.tts_first_audio(context)
+    session.bot_started()
+    session.tts_finished(context)
+    session.bot_stopped()
+
+
+def begin_output(session):
+    utterance = session.controller.pending
+    context = f"context-{utterance.id}"
+    session.tts_started(utterance.id, context)
+    session.tts_first_audio(context)
+    session.bot_started()
+
+
 async def settle():
     await asyncio.sleep(0)
     await asyncio.sleep(0)
@@ -45,8 +63,7 @@ async def test_multiple_final_stt_segments_one_turn_and_one_decision(tmp_path):
     session = InterviewSession(log, infer, input_adapter.speak, lambda _: None)
     input_adapter.session = session
     await session.start()
-    session.bot_started()
-    session.bot_stopped()
+    deliver(session)
 
     # Pipecat can forward a final STT segment before emitting the turn-start frame.
     for frame in (
@@ -98,14 +115,12 @@ async def test_fragment_after_follow_up_waits_for_continuation(tmp_path):
 
     session = InterviewSession(SessionLog(tmp_path, "fragment"), infer, speak, lambda _: None)
     await session.start()
-    session.bot_started()
-    session.bot_stopped()
+    deliver(session)
     await session.user_started()
     await session.user_stopped("I built an interview API")
     await settle()
     assert spoken[-1].text == "What did the API do?"
-    session.bot_started()
-    session.bot_stopped()
+    deliver(session)
 
     await session.user_started()
     await session.user_stopped("So the idea", segment_count=1)
@@ -144,13 +159,11 @@ async def test_spent_follow_up_does_not_force_advance(tmp_path):
 
     session = InterviewSession(SessionLog(tmp_path, "limit"), infer, speak, lambda _: None)
     await session.start()
-    session.bot_started()
-    session.bot_stopped()
+    deliver(session)
     await session.user_started()
     await session.user_stopped("I built an API")
     await settle()
-    session.bot_started()
-    session.bot_stopped()
+    deliver(session)
     await session.user_started()
     await session.user_stopped("So the idea")
     await settle()
@@ -179,7 +192,7 @@ async def test_barge_in_joins_several_segments_before_inference(tmp_path):
     )
     input_adapter.session = session
     await session.start()
-    session.bot_started()
+    begin_output(session)
     for frame in (
         UserStartedSpeakingFrame(),
         final("I built", 1),
@@ -217,8 +230,7 @@ async def test_stale_llm_result_after_continuation_cannot_advance(tmp_path):
 
     session = InterviewSession(SessionLog(tmp_path, "stale"), infer, speak, lambda _: None)
     await session.start()
-    session.bot_started()
-    session.bot_stopped()
+    deliver(session)
     await session.user_started()
     await session.user_stopped("I built an API")
     await settle()

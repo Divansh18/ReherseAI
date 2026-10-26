@@ -32,6 +32,24 @@ def harness(tmp_path):
     return session, spoken, published, decisions
 
 
+def deliver(session):
+    utterance = session.controller.pending
+    context = f"context-{utterance.id}"
+    session.tts_started(utterance.id, context)
+    session.tts_first_audio(context)
+    session.bot_started()
+    session.tts_finished(context)
+    session.bot_stopped()
+
+
+def begin_output(session):
+    utterance = session.controller.pending
+    context = f"context-{utterance.id}"
+    session.tts_started(utterance.id, context)
+    session.tts_first_audio(context)
+    session.bot_started()
+
+
 async def settle():
     await asyncio.sleep(0)
     await asyncio.sleep(0)
@@ -43,8 +61,7 @@ async def test_full_mocked_session_and_log(harness):
     await session.start()
     for number, question in enumerate(QUESTIONS, start=1):
         assert spoken[-1].text == question
-        session.bot_started()
-        session.bot_stopped()
+        deliver(session)
         assert session.controller.current_question_number == number
         await session.user_started()
         await session.user_stopped(f"Answer {number}: I built a parser")
@@ -52,8 +69,7 @@ async def test_full_mocked_session_and_log(harness):
     assert spoken[-1].text.startswith("Your parser story")
     assert [kind for kind, _ in decisions] == ["decision"] * 4 + ["feedback"]
     assert session.controller.stage is Stage.DELIVERING
-    session.bot_started()
-    session.bot_stopped()
+    deliver(session)
     assert session.controller.stage is Stage.COMPLETE
     assert any(message["event"]["event"] == "interview_complete" for message in published)
     await session.close()
@@ -79,8 +95,7 @@ async def test_barge_in_cancels_obsolete_inference_and_keeps_answer(tmp_path):
 
     session = InterviewSession(SessionLog(tmp_path, "cancel"), infer, speak, lambda _: None)
     await session.start()
-    session.bot_started()
-    session.bot_stopped()
+    deliver(session)
     await session.user_started()
     await session.user_stopped("I built a compiler")
     await settle()
@@ -98,7 +113,7 @@ async def test_interrupted_question_accepts_answer_without_stale_delivery(harnes
     session, spoken, published, _decisions = harness
     await session.start()
     original = spoken[-1]
-    session.bot_started()
+    begin_output(session)
     await session.user_started()
     session.bot_stopped()
     assert session.controller.current_question_number is None
