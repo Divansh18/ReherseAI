@@ -101,6 +101,18 @@ class InterviewController:
     def closing_remarks(self) -> tuple[str, ...]:
         return tuple(self._closing_remarks)
 
+    @property
+    def remaining_follow_ups(self) -> int:
+        if self._question_index < 0:
+            return MAX_FOLLOW_UPS_PER_QUESTION
+        return MAX_FOLLOW_UPS_PER_QUESTION - self._follow_ups[self._question_index]
+
+    @property
+    def remaining_clarifications(self) -> int:
+        if self._question_index < 0:
+            return MAX_CLARIFICATIONS_PER_QUESTION
+        return MAX_CLARIFICATIONS_PER_QUESTION - self._clarifications[self._question_index]
+
     def start(self) -> Utterance:
         self._require(Stage.NEW)
         return self._prepare(UtteranceKind.QUESTION, QUESTIONS[0], 0)

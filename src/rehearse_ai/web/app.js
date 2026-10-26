@@ -12,6 +12,7 @@ let peer = null;
 let microphone = null;
 let channel = null;
 const utterances = new Map();
+const answers = new Map();
 
 function status(message, mic = 'Microphone off', active = false) {
   connectionLabel.textContent = message;
@@ -39,6 +40,7 @@ function addTurn(speaker, text, id = null) {
     item.classList.add('prepared');
     utterances.set(id, item);
   }
+  return item;
 }
 
 function handleEvent(message) {
@@ -60,7 +62,16 @@ function handleEvent(message) {
   } else if (entry.event === 'agent_delivery_reported') {
     utterances.get(entry.utterance_id)?.classList.remove('prepared');
   } else if (entry.event === 'candidate_final' && entry.text) {
-    addTurn('candidate', entry.text);
+    const answerNumber = entry.answer_number ?? entry.sequence;
+    const previous = answers.get(answerNumber);
+    if (previous) {
+      previous.append(document.createTextNode(` ${entry.text}`));
+    } else {
+      answers.set(answerNumber, addTurn('candidate', entry.text));
+    }
+    transcript.scrollTop = transcript.scrollHeight;
+  } else if (entry.event === 'awaiting_continuation') {
+    status('Keep going when you’re ready', 'Microphone on', true);
   } else if (entry.event === 'interview_complete') {
     status('Interview complete', 'Microphone still connected', true);
   } else if (entry.event === 'clarification_limit') {
@@ -100,6 +111,11 @@ async function waitForIce(pc) {
 
 async function startSession() {
   errorLabel.hidden = true;
+  transcript.innerHTML = '<li class="empty">Your conversation will appear here as it happens.</li>';
+  utterances.clear();
+  answers.clear();
+  questionLabel.textContent = 'Your first question will appear here.';
+  questionCount.textContent = '01 / 04';
   startButton.disabled = true;
   status('Requesting microphone…');
   try {

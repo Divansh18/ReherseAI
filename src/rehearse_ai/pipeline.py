@@ -15,6 +15,8 @@ from pipecat.frames.frames import (
     TTSSpeakFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import WorkerRunner
@@ -41,7 +43,10 @@ from rehearse_ai.session_log import SessionLog
 DECISION_SCHEMA = {
     "type": "object",
     "properties": {
-        "action": {"type": "string", "enum": ["follow_up", "nudge", "clarification", "advance"]},
+        "action": {
+            "type": "string",
+            "enum": ["follow_up", "nudge", "clarification", "wait", "advance"],
+        },
         "text": {"type": "string"},
     },
     "required": ["action", "text"],
@@ -62,6 +67,7 @@ class InterviewInput(FrameProcessor):
         super().__init__()
         self.session: InterviewSession | None = None
         self._segments: list[str] = []
+        self._turn_open = False
 
     async def speak(self, utterance: Utterance) -> None:
         await self.push_frame(TTSSpeakFrame(text=utterance.text, append_to_context=False))
@@ -70,14 +76,33 @@ class InterviewInput(FrameProcessor):
         await super().process_frame(frame, direction)
         if direction is FrameDirection.DOWNSTREAM and self.session is not None:
             if isinstance(frame, UserStartedSpeakingFrame):
-                self._segments.clear()
-                await self.session.user_started()
+                if not self._turn_open:
+                    self._turn_open = True
+                    await self.session.user_started()
+            elif isinstance(frame, VADUserStartedSpeakingFrame):
+                self.session.turn_signal("vad_started", frame_id=frame.id)
+            elif isinstance(frame, VADUserStoppedSpeakingFrame):
+                self.session.turn_signal(
+                    "vad_stopped", frame_id=frame.id, stop_secs=frame.stop_secs
+                )
             elif isinstance(frame, TranscriptionFrame):
                 if frame.text.strip():
                     self._segments.append(frame.text.strip())
+                    self.session.transcript_segment(
+                        frame.text.strip(),
+                        frame_timestamp=frame.timestamp,
+                        finalized=frame.finalized,
+                        frame_id=frame.id,
+                    )
             elif isinstance(frame, UserStoppedSpeakingFrame):
-                await self.session.user_stopped(" ".join(self._segments))
-                self._segments.clear()
+                if self._turn_open or self._segments:
+                    await self.session.user_stopped(
+                        " ".join(self._segments),
+                        segment_count=len(self._segments),
+                        boundary_frame_id=frame.id,
+                    )
+                    self._turn_open = False
+                    self._segments.clear()
         await self.push_frame(frame, direction)
 
 
@@ -129,7 +154,11 @@ class LiveSession:
         input_adapter = InterviewInput()
         delivery = DeliveryObserver()
         self.session = InterviewSession(
-            self.log, inference_adapter(llm), input_adapter.speak, connection.send_app_message
+            self.log,
+            inference_adapter(llm),
+            input_adapter.speak,
+            connection.send_app_message,
+            turn_pause_secs=settings.turn_pause_secs,
         )
         input_adapter.session = self.session
         delivery.session = self.session
@@ -150,6 +179,7 @@ class LiveSession:
                     settings=DeepgramSTTService.Settings(model=settings.stt_model),
                 ),
                 UserTurnProcessor(
+                    user_turn_stop_timeout=30.0,
                     user_turn_strategies=UserTurnStrategies(
                         start=[VADUserTurnStartStrategy(), TranscriptionUserTurnStartStrategy()],
                         stop=[
@@ -157,7 +187,7 @@ class LiveSession:
                                 user_speech_timeout=settings.turn_pause_secs
                             )
                         ],
-                    )
+                    ),
                 ),
                 input_adapter,
                 OpenAITTSService(

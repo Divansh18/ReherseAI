@@ -26,7 +26,7 @@ class Settings:
     vad_confidence: float = 0.7
     vad_start_secs: float = 0.2
     vad_stop_secs: float = 0.35
-    turn_pause_secs: float = 0.8
+    turn_pause_secs: float = 1.1
 
     @classmethod
     def load(
@@ -105,5 +105,5 @@ class Settings:
             vad_confidence=number("REHEARSE_VAD_CONFIDENCE", "0.7", low=0.1, high=1.0),
             vad_start_secs=number("REHEARSE_VAD_START_SECS", "0.2", low=0.05, high=2.0),
             vad_stop_secs=number("REHEARSE_VAD_STOP_SECS", "0.35", low=0.1, high=2.0),
-            turn_pause_secs=number("REHEARSE_TURN_PAUSE_SECS", "0.8", low=0.2, high=5.0),
+            turn_pause_secs=number("REHEARSE_TURN_PAUSE_SECS", "1.1", low=0.2, high=5.0),
         )

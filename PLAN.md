@@ -11,7 +11,7 @@ Python asks these main questions exactly and in order:
 3. How did you know it was working well?
 4. What would you do differently now?
 
-The LLM may propose a context-aware follow-up, nudge, clarification, or advance. Python limits each question to one substantive follow-up/nudge and one clarification/repeat, selects each next main question, and blocks progress after closing feedback delivery. Candidate text is untrusted data. Closing feedback must use actual recorded answers and contain 2–3 short spoken sentences.
+The LLM may propose a context-aware follow-up, nudge, clarification, wait, or advance. Python limits each question to one substantive follow-up/nudge and one clarification/repeat, selects each next main question, and blocks progress after closing feedback delivery. A `wait` decision leaves a fragmented answer open, and a rejected proposal never implicitly advances. Candidate text is untrusted data. Closing feedback must use actual recorded answers and contain 2–3 short spoken sentences.
 
 ## Five milestones
 
@@ -19,21 +19,27 @@ The LLM may propose a context-aware follow-up, nudge, clarification, or advance.
 | --- | --- |
 | 1. Foundation | Complete: package, `uv` lock, configuration template, checks, foundation commit. |
 | 2. Interview policy | Complete: four-question delivery-aware state machine and deterministic tests. |
-| 3. Local voice loop | Implemented: cascaded Pipecat services, loopback SmallWebRTC server, browser, prompt files, and session logging. Offline tests and HTTP smoke check pass. Acceptance of **real voice behavior is pending credentials and live audio testing**. |
-| 4. Observability and prompts | Foundation implemented: exact versioned prompts and local event log. Review genuine logs, tune turn settings, and document prompt experiments only after running them. |
-| 5. Real-session verification | Pending: record a genuine session, inspect four-question order, relevance, brief feedback, pause/barge-in handling, and measured latency. Fix any observed faults and finalize troubleshooting docs. |
+| 3. Local voice loop | Implemented: cascaded Pipecat services, loopback SmallWebRTC server, browser, prompt files, and session logging. A real session revealed premature advancement during a follow-up. The fix is offline-tested; the next real voice check is pending. |
+| 4. Observability and prompts | Raw STT, VAD, boundary, and decision events are now logged alongside the exact versioned prompts. Tune turn settings and document prompt experiments only after running them. |
+| 5. Real-session verification | Pending: rerun a genuine session on the fix, inspect four-question order, relevance, brief feedback, pause/barge-in handling, and measured latency. Fix any observed faults and finalize troubleshooting docs. |
 
 ## Delivery and interruption contract
 
 An agent utterance is first *prepared* with a session-scoped ID. Generation does not count as delivery. The delivery observer calls `delivery_finished(id)` only on Pipecat's `BotStoppedSpeakingFrame` after its output transport; duplicate and stale IDs are ignored. That frame is a server output completion signal, not proof of browser playout or human hearing. The browser transcript therefore distinguishes prepared, interrupted, and server-reported completed speech.
 
-Pipecat `UserTurnProcessor` uses VAD/transcription start strategies and one `SpeechTimeoutUserTurnStopStrategy`. There is no separate application end-of-turn timer. On barge-in, Pipecat broadcasts an interruption to cancel speech output; `InterviewSession` cancels an in-flight LLM task and invalidates the pending utterance ID. If the new candidate turn contains a substantive answer, Python accepts it for the interrupted question/follow-up and continues. If it is empty or asks for a repeat, the interrupted text is retried with a fresh ID. Interrupted closing feedback can be replanned from actual answers plus closing remarks, but the interview is not marked complete until a new feedback utterance reaches its delivery event.
+Pipecat `UserTurnProcessor` uses VAD/transcription start strategies and one `SpeechTimeoutUserTurnStopStrategy` for normal turn completion. Its silence policy is now 1.1 seconds, with a 30-second processor watchdog for failure recovery. There is no application end-of-turn timer. On barge-in, Pipecat broadcasts an interruption immediately to cancel speech output; `InterviewSession` cancels an in-flight LLM task and invalidates the pending utterance ID. If the new candidate turn contains a substantive answer, Python accepts it for the interrupted question/follow-up and continues. If it is empty or asks for a repeat, the interrupted text is retried with a fresh ID. Interrupted closing feedback can be replanned from actual answers plus closing remarks, but the interview is not marked complete until a new feedback utterance reaches its delivery event.
+
+## Follow-up turn diagnosis
+
+The inspected real session log shows a follow-up interrupted at event 16, `candidate_final` with only “So the idea” at event 18, `proposal_rejected` at event 20, and question two prepared at event 21. The previous `REHEARSE_TURN_PAUSE_SECS` default was 0.8 seconds. The log lacked VAD and raw STT events, so the exact silence duration and rejected action are unknown. In the installed Pipecat 1.14.0 source, Deepgram final chunks produce `TranscriptionFrame`; `SpeechTimeoutUserTurnStopStrategy` controls turn completion after VAD stop and its configured wait. The controller did not advance merely when the allowance was spent, but the session orchestration converted any rejected proposal into `ADVANCE`. That fallback and the early boundary together caused the visible jump. There is no evidence of duplicate callbacks or a stale LLM reply in the recorded event sequence. The follow-up had no `agent_output_started` event before interruption, despite the user's report that it was heard; check delivery observation in the next live run.
+
+The adapter now retains final segments that arrive before `UserStartedSpeakingFrame`, joins all final segments until one `UserStoppedSpeakingFrame`, and ignores a duplicate stop frame. An incomplete answer can cause a silent `wait`; new speech appends to the same answer. The UI merges continuation turns, while JSONL retains each raw timestamped segment and the inferred boundary. One decision inference is started per completed candidate turn; a resumed candidate turn cancels the previous inference. These are offline-tested changes, not proof that the new 1.1-second setting handles the actual microphone pause.
 
 ## Open decisions and verification
 
-- `DEEPGRAM_API_KEY` is not yet configured for this workspace. No genuine Deepgram/OpenAI voice session, quality comparison, prompt experiment, or latency benchmark has been run. Credentials remain in ignored `.env`.
-- Confirm the full WebRTC answer, data-channel messages, browser playout, and cleanup with real microphone/audio access. The HTTP page and health endpoint have been smoke-tested only.
-- Tune VAD start/stop and the 0.8-second turn pause from a real session, especially for short mid-answer pauses and noisy microphones.
+- Repeat the actual follow-up interruption and “So the idea…” pause with the new code. Compare VAD stop, STT segment, turn completion, decision, and output timestamps in the new log. A 0.9–1.2 second pause range is an initial tuning experiment, not a guaranteed solution.
+- Check browser playout and cleanup in the next real session; server delivery still does not prove browser playout.
+- Review whether the revised `wait` prompt makes suitable decisions after incomplete answers. Its new behavior is not yet live-tested, and no latency or quality benchmark has been run.
 - Consider browser playout acknowledgment if stronger delivery evidence is needed; current Pipecat server event is deliberately labeled approximate.
 - Decide which genuine evidence can be shared. Raw session logs and recordings are ignored by Git.
 

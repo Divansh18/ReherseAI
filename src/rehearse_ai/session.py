@@ -27,7 +27,15 @@ _REPEAT = re.compile(
 
 
 class InterviewSession:
-    def __init__(self, log: SessionLog, infer: Infer, speak: Speak, publish: Publish) -> None:
+    def __init__(
+        self,
+        log: SessionLog,
+        infer: Infer,
+        speak: Speak,
+        publish: Publish,
+        *,
+        turn_pause_secs: float = 1.1,
+    ) -> None:
         self.controller = InterviewController()
         self.log = log
         self._infer = infer
@@ -36,7 +44,12 @@ class InterviewSession:
         self._response_task: asyncio.Task[None] | None = None
         self._generation = 0
         self._speaking_id: int | None = None
+        self._active_prompt_id: int | None = None
         self._last_turn_end: float | None = None
+        self._turn_started_at: float | None = None
+        self._turn_number = 0
+        self._answer_number = 0
+        self._turn_pause_secs = turn_pause_secs
         self._closed = False
 
     @property
@@ -47,6 +60,24 @@ class InterviewSession:
         entry = self.log.record(event, **details)
         self._publish({"type": "rehearseai", "event": entry})
 
+    def turn_signal(self, signal: str, **details: Any) -> None:
+        if not self._closed:
+            self._record(signal, speaker="candidate", turn_number=self._turn_number, **details)
+
+    def transcript_segment(
+        self, text: str, *, frame_timestamp: str, finalized: bool, frame_id: int
+    ) -> None:
+        if not self._closed:
+            self._record(
+                "stt_final_segment",
+                speaker="candidate",
+                text=text,
+                turn_number=self._turn_number,
+                frame_timestamp=frame_timestamp,
+                finalized=finalized,
+                frame_id=frame_id,
+            )
+
     async def start(self) -> None:
         if self._closed or self.controller.stage is not Stage.NEW:
             return
@@ -54,6 +85,7 @@ class InterviewSession:
         await self._queue_speech(self.controller.start())
 
     async def _queue_speech(self, utterance: Utterance) -> None:
+        self._active_prompt_id = utterance.id
         self._record(
             "agent_prepared",
             speaker="agent",
@@ -71,6 +103,9 @@ class InterviewSession:
         self._generation += 1
         task = self._response_task
         if task and not task.done():
+            self._record(
+                "inference_cancel_requested", speaker=None, generation=self._generation - 1
+            )
             task.cancel()
         self._response_task = None
         pending = self.controller.pending
@@ -83,14 +118,49 @@ class InterviewSession:
                 text=pending.text,
                 interrupted=True,
             )
-        self._record("candidate_started", speaker="candidate")
+        self._turn_number += 1
+        self._turn_started_at = time.perf_counter()
+        self._record(
+            "candidate_started",
+            speaker="candidate",
+            turn_number=self._turn_number,
+            question_number=self.controller.current_question_number,
+        )
 
-    async def user_stopped(self, text: str) -> None:
+    async def user_stopped(
+        self,
+        text: str,
+        *,
+        segment_count: int | None = None,
+        boundary_frame_id: int | None = None,
+    ) -> None:
         if self._closed or self.controller.stage is Stage.COMPLETE:
             return
         answer = text.strip()
         self._last_turn_end = time.perf_counter()
-        self._record("candidate_final", speaker="candidate", text=answer)
+        continuing = self.controller.stage in {Stage.AWAITING_PROPOSAL, Stage.AWAITING_FEEDBACK}
+        if not continuing:
+            self._answer_number += 1
+        duration = (
+            round((self._last_turn_end - self._turn_started_at) * 1000, 1)
+            if self._turn_started_at is not None
+            else None
+        )
+        self._record(
+            "candidate_final",
+            speaker="candidate",
+            text=answer,
+            turn_number=self._turn_number,
+            answer_number=self._answer_number,
+            question_number=self.controller.current_question_number,
+            prompt_utterance_id=self._active_prompt_id,
+            segment_count=segment_count,
+            turn_duration_ms=duration,
+            boundary="Pipecat UserStoppedSpeakingFrame",
+            boundary_frame_id=boundary_frame_id,
+            configured_pause_secs=self._turn_pause_secs,
+        )
+        self._turn_started_at = None
 
         interrupted = self.controller.interrupted_utterance
         if interrupted is not None:
@@ -113,8 +183,12 @@ class InterviewSession:
                 await self._queue_speech(utterance)
                 return
         elif self.controller.stage is Stage.AWAITING_PROPOSAL:
+            if not answer:
+                return
             self.controller.add_answer_continuation(answer)
         elif self.controller.stage is Stage.AWAITING_FEEDBACK:
+            if not answer:
+                return
             self.controller.add_closing_remarks(answer)
         else:
             return
@@ -133,31 +207,87 @@ class InterviewSession:
             "answers_by_question": [list(turns) for turns in self.controller.answers],
             "closing_remarks": list(self.controller.closing_remarks),
             "max_extra_prompts_per_question": {"follow_up_or_nudge": 1, "clarification": 1},
+            "remaining_follow_ups": self.controller.remaining_follow_ups,
+            "remaining_clarifications": self.controller.remaining_clarifications,
         }
 
     async def _respond(self, generation: int) -> None:
         try:
             if self.controller.stage is Stage.AWAITING_PROPOSAL:
+                started_at = time.perf_counter()
+                self._record(
+                    "inference_started",
+                    speaker=None,
+                    generation=generation,
+                    purpose="decision",
+                    answer_number=self._answer_number,
+                )
                 result = await self._infer("decision", self._payload())
                 if generation != self._generation or self._closed:
+                    self._record("inference_stale_discarded", speaker=None, generation=generation)
                     return
+                self._record(
+                    "inference_completed",
+                    speaker=None,
+                    generation=generation,
+                    purpose="decision",
+                    duration_ms=round((time.perf_counter() - started_at) * 1000, 1),
+                )
                 action = str(result.get("action", "")).upper()
                 text = result.get("text", "")
+                self._record(
+                    "decision_proposed",
+                    speaker=None,
+                    generation=generation,
+                    action=action.lower(),
+                    text=text if isinstance(text, str) else None,
+                    remaining_follow_ups=self.controller.remaining_follow_ups,
+                    remaining_clarifications=self.controller.remaining_clarifications,
+                )
+                if action == "WAIT":
+                    self._record(
+                        "awaiting_continuation", speaker=None, answer_number=self._answer_number
+                    )
+                    return
                 try:
                     kind = ReplyKind[action]
                     speech = text if kind is not ReplyKind.ADVANCE else None
                     utterance = self.controller.propose(kind, speech)
-                except (KeyError, ValueError):
-                    self._record("proposal_rejected", speaker=None)
-                    utterance = self.controller.propose(ReplyKind.ADVANCE)
+                except (KeyError, ValueError) as exc:
+                    self._record(
+                        "proposal_rejected",
+                        speaker=None,
+                        reason=type(exc).__name__,
+                        action=action.lower(),
+                    )
+                    self._record(
+                        "awaiting_continuation", speaker=None, answer_number=self._answer_number
+                    )
+                    return
                 if utterance is not None:
                     await self._queue_speech(utterance)
                     return
 
             if self.controller.stage is Stage.AWAITING_FEEDBACK:
+                started_at = time.perf_counter()
+                self._record(
+                    "inference_started",
+                    speaker=None,
+                    generation=generation,
+                    purpose="feedback",
+                    answer_number=self._answer_number,
+                )
                 result = await self._infer("feedback", self._payload())
                 if generation != self._generation or self._closed:
+                    self._record("inference_stale_discarded", speaker=None, generation=generation)
                     return
+                self._record(
+                    "inference_completed",
+                    speaker=None,
+                    generation=generation,
+                    purpose="feedback",
+                    duration_ms=round((time.perf_counter() - started_at) * 1000, 1),
+                )
                 lines = result.get("lines")
                 if not isinstance(lines, list) or not all(isinstance(line, str) for line in lines):
                     raise ValueError("Feedback response did not contain lines")
