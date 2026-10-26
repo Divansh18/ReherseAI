@@ -8,6 +8,7 @@ from typing import Any
 
 from rehearse_ai.interview import (
     InterviewController,
+    InvalidTransition,
     LimitReached,
     Readiness,
     ReplyKind,
@@ -69,7 +70,8 @@ _BARE_AFFIRM_READINESS = re.compile(
 )
 _FINAL_START = re.compile(r"\b(?:start|begin)(?: now| please)?$")
 _NAME_INTRO = re.compile(
-    r"\b(i(?:'m| am)|my name is|call me)\s+([A-Za-z]+)(?:\s+([A-Za-z]+))?", re.I
+    r"\b(i(?:'m| am)|my name is|name is|call me)\s*,?\s+([A-Za-z]+)(?:\s+([A-Za-z]+))?",
+    re.I,
 )
 _NAME_DECLINE = re.compile(
     r"\b(?:rather not|prefer not|do not want to|don't want to|no need to)\b.*\bname\b",
@@ -118,7 +120,7 @@ def _preferred_name(text: str, *, prompted: bool) -> str | None:
     match = _NAME_INTRO.search(normalized)
     if match:
         prefix, first, second = match.groups()
-        explicit_name = prefix.lower() in {"my name is", "call me"}
+        explicit_name = prefix.lower() in {"my name is", "name is", "call me"}
         if first.lower() not in _NON_NAMES and (explicit_name or first[0].isupper()):
             parts = [first]
             if second and second.lower() not in _NON_NAMES and second[0].isupper():
@@ -143,6 +145,19 @@ def _asks_about_name(text: str) -> bool:
         addressed_to_coach
         and (_NAME_DETOUR.search(text) or ("?" in text and _NAME_KNOWLEDGE.search(text)))
     )
+
+
+def _is_sentence_request(pattern: re.Pattern[str], text: str) -> bool:
+    """Recognize a whole control clause even after a separate preamble."""
+    return any(pattern.fullmatch(clause.strip()) for clause in re.split(r"(?<=[.!?])\s+", text))
+
+
+def _may_need_opening_interpretation(text: str) -> bool:
+    return "?" in text or "your name" in text.lower() or "call you" in text.lower()
+
+
+def _asks_coach_identity(text: str) -> bool:
+    return bool(re.search(r"\byour\s+name\b|\bcall\s+you\b", text, re.I))
 
 
 def _classify_readiness(text: str) -> Readiness:
@@ -219,9 +234,11 @@ class InterviewSession:
         self._speaking_id: int | None = None
         self._active_prompt_id: int | None = None
         self._last_delivered_prompt: Utterance | None = None
+        self._last_project_prompt: Utterance | None = None
         self._output_started_ids: set[int] = set()
         self._tts_completed_ids: set[int] = set()
         self._tts_contexts: dict[str, int] = {}
+        self._tts_context_history: dict[str, int] = {}
         self._first_audio_ids: set[int] = set()
         self._interrupted_output_id: int | None = None
         self._cancelled_output_stop_debt = 0
@@ -235,6 +252,8 @@ class InterviewSession:
         self._closed = False
         self._answer_snapshot: tuple[str, ...] | None = None
         self._latest_candidate_turn = ""
+        self._opening_interpret_text: str | None = None
+        self._no_project_turn: str | None = None
 
     @property
     def response_task(self) -> asyncio.Task[None] | None:
@@ -433,6 +452,9 @@ class InterviewSession:
                 await self._queue_speech(self.controller.retry_interrupted())
             return
 
+        if await self._route_control_request(answer):
+            return
+
         if await self._route_opening(answer):
             return
 
@@ -468,7 +490,10 @@ class InterviewSession:
                 self._start_response()
             return
 
-        if _SKIP.fullmatch(answer) and self.controller.interrupted_utterance is not None:
+        if (
+            _is_sentence_request(_SKIP, answer)
+            and self.controller.interrupted_utterance is not None
+        ):
             try:
                 utterance = self.controller.skip_interrupted()
             except ValueError:
@@ -485,7 +510,7 @@ class InterviewSession:
             if interrupted.kind.name == "EARLY_FEEDBACK":
                 await self._queue_speech(self.controller.retry_interrupted())
                 return
-            if not answer or _REPEAT.fullmatch(answer):
+            if not answer or _is_sentence_request(_REPEAT, answer):
                 await self._queue_speech(self.controller.retry_interrupted())
                 return
             if self._interrupted_output_id != interrupted.id:
@@ -511,11 +536,11 @@ class InterviewSession:
             self._interrupted_output_id = None
         elif self.controller.stage is Stage.AWAITING_ANSWER:
             try:
-                if _SKIP.fullmatch(answer):
+                if _is_sentence_request(_SKIP, answer):
                     utterance = self.controller.skip_current()
                     self._record("candidate_skipped_question", speaker="candidate")
-                elif _REPEAT.fullmatch(answer):
-                    utterance = self.controller.request_repeat()
+                elif _is_sentence_request(_REPEAT, answer):
+                    utterance = self.controller.request_repeat(self._last_project_prompt)
                 else:
                     self._answer_snapshot = self.controller.answers[
                         self.controller.current_question_number - 1
@@ -528,7 +553,7 @@ class InterviewSession:
             if utterance is not None:
                 await self._queue_speech(utterance)
                 return
-            if _SKIP.fullmatch(answer):
+            if _is_sentence_request(_SKIP, answer):
                 self._start_response()
                 return
         elif self.controller.stage is Stage.AWAITING_PROPOSAL:
@@ -543,24 +568,92 @@ class InterviewSession:
             if not answer:
                 return
             self.controller.add_closing_remarks(answer)
+        elif self.controller.stage in {
+            Stage.AWAITING_NO_PROJECT_EXAMPLE,
+            Stage.AWAITING_NO_PROJECT_CHOICE,
+        }:
+            if not answer:
+                self._record("no_project_waiting", speaker=None)
+                return
+            self._no_project_turn = answer
+            self._latest_candidate_turn = answer
         else:
             return
 
         self._start_response()
 
-    async def _route_opening(self, answer: str) -> bool:
+    async def _route_control_request(self, answer: str) -> bool:
+        """Apply explicit controls before opening gates or answer collection."""
+        if _is_sentence_request(_REPEAT, answer):
+            interrupted = self.controller.interrupted_utterance
+            if interrupted is not None:
+                self._record(
+                    "candidate_repeat_requested", speaker="candidate", prompt_id=interrupted.id
+                )
+                await self._queue_speech(self.controller.retry_interrupted())
+                return True
+            if self.controller.stage in {Stage.AWAITING_ANSWER, Stage.AWAITING_PROPOSAL}:
+                try:
+                    utterance = self.controller.request_repeat(self._last_project_prompt)
+                except LimitReached:
+                    self._record("clarification_limit", speaker=None)
+                    return True
+                self._record(
+                    "candidate_repeat_requested", speaker="candidate", prompt_id=utterance.id
+                )
+                await self._queue_speech(utterance)
+                return True
+            if self.controller.stage in {
+                Stage.AWAITING_NO_PROJECT_EXAMPLE,
+                Stage.AWAITING_NO_PROJECT_CHOICE,
+            }:
+                try:
+                    utterance = self.controller.repeat_no_project_prompt()
+                except LimitReached:
+                    self._record("no_project_repeat_limit", speaker=None)
+                    return True
+                self._record(
+                    "candidate_repeat_requested", speaker="candidate", prompt_id=utterance.id
+                )
+                await self._queue_speech(utterance)
+                return True
+        if _is_sentence_request(_SKIP, answer):
+            interrupted = self.controller.interrupted_utterance
+            try:
+                if interrupted is not None and interrupted.question_number is not None:
+                    utterance = self.controller.skip_interrupted()
+                elif self.controller.stage is Stage.AWAITING_ANSWER:
+                    utterance = self.controller.skip_current()
+                else:
+                    return False
+            except InvalidTransition:
+                if self.controller.current_question_number != 1:
+                    raise
+                self._record("project_example_required", speaker=None, request="skip")
+                await self._queue_speech(self.controller.offer_project_example())
+                return True
+            self._record("candidate_skipped_question", speaker="candidate")
+            if utterance is None:
+                self._start_response()
+            else:
+                await self._queue_speech(utterance)
+            return True
+        return False
+
+    async def _route_opening(self, answer: str, *, allow_interpretation: bool = True) -> bool:
         interrupted = self.controller.interrupted_utterance
         opening_kinds = {
             UtteranceKind.GREETING,
             UtteranceKind.OPENING_ACK,
             UtteranceKind.NAME_PROMPT,
             UtteranceKind.NAME_ACK,
+            UtteranceKind.OPENING_COACH_REPLY,
             UtteranceKind.READINESS,
             UtteranceKind.OPENING_WAIT,
             UtteranceKind.OPENING_CLARIFICATION,
         }
         if interrupted is not None and interrupted.kind in opening_kinds:
-            if not answer or _REPEAT.fullmatch(answer):
+            if not answer or _is_sentence_request(_REPEAT, answer):
                 await self._queue_speech(self.controller.retry_interrupted())
                 return True
             if (
@@ -569,6 +662,16 @@ class InterviewSession:
                     UtteranceKind.OPENING_WAIT,
                     UtteranceKind.OPENING_CLARIFICATION,
                 }
+                and not (
+                    interrupted.kind is UtteranceKind.NAME_PROMPT
+                    and (
+                        _preferred_name(answer, prompted=True)
+                        or _may_need_opening_interpretation(answer)
+                    )
+                )
+                and not (
+                    interrupted.kind is UtteranceKind.READINESS and _asks_coach_identity(answer)
+                )
                 and self._interrupted_output_id != interrupted.id
             ):
                 self._record(
@@ -587,7 +690,7 @@ class InterviewSession:
             try:
                 utterance = (
                     self.controller.request_opening_repeat()
-                    if not answer or _REPEAT.fullmatch(answer)
+                    if not answer or _is_sentence_request(_REPEAT, answer)
                     else self.controller.submit_greeting(answer)
                 )
             except LimitReached:
@@ -603,8 +706,44 @@ class InterviewSession:
             await self._queue_speech(self.controller.begin_question_one())
             return True
 
+        if self.controller.stage is Stage.AWAITING_OPENING_RETURN:
+            utterance = (
+                self.controller.start_after_opening_question()
+                if _classify_readiness(answer) is Readiness.READY
+                else self.controller.resume_opening_question()
+            )
+            await self._queue_speech(utterance)
+            return True
+
+        if (
+            answer
+            and self.controller.stage in {Stage.AWAITING_NAME, Stage.AWAITING_READINESS}
+            and _asks_coach_identity(answer)
+        ):
+            name = _preferred_name(answer, prompted=self.controller.stage is Stage.AWAITING_NAME)
+            self._record(
+                "candidate_detour",
+                speaker="candidate",
+                kind="coach_identity",
+                preferred_name=name,
+            )
+            await self._queue_speech(
+                self.controller.answer_opening_question("You can call me RehearseAI.", name)
+            )
+            return True
+
+        if (
+            allow_interpretation
+            and answer
+            and self.controller.stage in {Stage.AWAITING_NAME, Stage.AWAITING_READINESS}
+            and _may_need_opening_interpretation(answer)
+        ):
+            self._opening_interpret_text = answer
+            self._start_response()
+            return True
+
         if self.controller.stage is Stage.AWAITING_NAME:
-            if not answer or _REPEAT.fullmatch(answer):
+            if not answer or _is_sentence_request(_REPEAT, answer):
                 await self._queue_speech(self.controller.retry_name_prompt())
                 return True
             readiness = _classify_greeting_readiness(answer)
@@ -624,7 +763,7 @@ class InterviewSession:
             return True
 
         if self.controller.stage is Stage.AWAITING_OPENING_ACK:
-            if _REPEAT.fullmatch(answer):
+            if _is_sentence_request(_REPEAT, answer):
                 try:
                     await self._queue_speech(self.controller.request_opening_repeat())
                 except LimitReached:
@@ -637,7 +776,7 @@ class InterviewSession:
             return True
 
         if self.controller.stage is Stage.AWAITING_READINESS:
-            if not answer or _REPEAT.fullmatch(answer):
+            if not answer or _is_sentence_request(_REPEAT, answer):
                 try:
                     await self._queue_speech(self.controller.request_opening_repeat())
                 except LimitReached:
@@ -718,11 +857,19 @@ class InterviewSession:
     def _payload(self) -> dict[str, Any]:
         index = self.controller.current_question_number
         current_answers = list(self.controller.answers[index - 1]) if index else []
+        phase = {
+            Stage.AWAITING_NAME: "name",
+            Stage.AWAITING_READINESS: "readiness",
+            Stage.AWAITING_NO_PROJECT_EXAMPLE: "no_project_example",
+            Stage.AWAITING_NO_PROJECT_CHOICE: "no_project_choice",
+        }.get(self.controller.stage, "interview")
         return {
+            "phase": phase,
             "current_question_number": self.controller.current_question_number,
             "current_question": self.controller.current_question,
             "greeting_response": self.controller.greeting_response,
             "preferred_name": self.controller.preferred_name,
+            "project_established": self.controller.project_established,
             "answers_by_question": [list(turns) for turns in self.controller.answers],
             "current_question_answers": current_answers,
             "current_question_answer": " ".join(current_answers),
@@ -731,6 +878,9 @@ class InterviewSession:
             ),
             "last_delivered_prompt_id": (
                 self._last_delivered_prompt.id if self._last_delivered_prompt else None
+            ),
+            "last_project_prompt": (
+                self._last_project_prompt.text if self._last_project_prompt else None
             ),
             "interrupted_prompt": (
                 self.controller.interrupted_utterance.text
@@ -746,7 +896,60 @@ class InterviewSession:
         }
 
     async def _respond(self, generation: int) -> None:
+        opening_turn: str | None = None
+        inference_purpose: str | None = None
+        inference_returned = False
         try:
+            if (
+                not self._stop_latched
+                and self.controller.stage in {Stage.AWAITING_NAME, Stage.AWAITING_READINESS}
+                and self._opening_interpret_text is not None
+            ):
+                turn = self._opening_interpret_text
+                opening_turn = turn
+                self._record(
+                    "inference_started",
+                    speaker=None,
+                    generation=generation,
+                    purpose="opening_intent",
+                )
+                inference_purpose = "opening_intent"
+                result = await self._infer(
+                    "decision", {**self._payload(), "latest_candidate_turn": turn}
+                )
+                inference_returned = True
+                if generation != self._generation or self._closed:
+                    self._record("inference_stale_discarded", speaker=None, generation=generation)
+                    return
+                self._opening_interpret_text = None
+                action = str(result.get("action", "")).lower()
+                self._record(
+                    "opening_intent_proposed", speaker=None, generation=generation, action=action
+                )
+                if action == "detour":
+                    reply = result.get("text")
+                    if (
+                        not isinstance(reply, str)
+                        or not reply.strip()
+                        or len(reply) > 120
+                        or "?" in reply
+                    ):
+                        raise ValueError("Invalid coach-directed opening reply")
+                    name = _preferred_name(
+                        turn, prompted=self.controller.stage is Stage.AWAITING_NAME
+                    )
+                    utterance = self.controller.answer_opening_question(reply, name)
+                    self._record(
+                        "candidate_detour",
+                        speaker="candidate",
+                        kind="opening_question",
+                        preferred_name=name,
+                    )
+                    await self._queue_speech(utterance)
+                    return
+                await self._route_opening(turn, allow_interpretation=False)
+                return
+
             if not self._stop_latched and self.controller.stage is Stage.AWAITING_OPENING_ACK:
                 if name := _preferred_name(self.controller.greeting_response, prompted=False):
                     self.controller.remember_name(name)
@@ -764,10 +967,12 @@ class InterviewSession:
                 self._record(
                     "inference_started", speaker=None, generation=generation, purpose="opening_ack"
                 )
+                inference_purpose = "opening_ack"
                 result = await self._infer(
                     "opening_ack",
                     {**self._payload(), "greeting_readiness": greeting_readiness.name.lower()},
                 )
+                inference_returned = True
                 if generation != self._generation or self._closed:
                     self._record("inference_stale_discarded", speaker=None, generation=generation)
                     return
@@ -799,6 +1004,66 @@ class InterviewSession:
                 await self._queue_speech(utterance)
                 return
 
+            if not self._stop_latched and self.controller.stage in {
+                Stage.AWAITING_NO_PROJECT_EXAMPLE,
+                Stage.AWAITING_NO_PROJECT_CHOICE,
+            }:
+                phase = self.controller.stage
+                turn = self._no_project_turn or ""
+                self._record(
+                    "inference_started",
+                    speaker=None,
+                    generation=generation,
+                    purpose="no_project_decision",
+                )
+                inference_purpose = "no_project_decision"
+                result = await self._infer("decision", self._payload())
+                inference_returned = True
+                if generation != self._generation or self._closed:
+                    self._record("inference_stale_discarded", speaker=None, generation=generation)
+                    return
+                status = result.get("project_status", "unclear")
+                action = str(result.get("action", "")).upper()
+                self._record(
+                    "decision_proposed",
+                    speaker=None,
+                    generation=generation,
+                    action=action.lower(),
+                    project_status=status,
+                    purpose="no_project_decision",
+                    validated=True,
+                )
+                if status == "technical_example":
+                    self._answer_snapshot = self.controller.answers[0]
+                    self.controller.accept_project_example(turn)
+                    self._record("project_example_accepted", speaker="candidate")
+                    if action == "WAIT":
+                        self._record("awaiting_continuation", speaker=None)
+                        return
+                    if action in ReplyKind.__members__ and action != "DETOUR":
+                        kind = ReplyKind[action]
+                        utterance = self.controller.propose(
+                            kind, None if kind is ReplyKind.ADVANCE else result.get("text")
+                        )
+                        if utterance:
+                            await self._queue_speech(utterance)
+                        else:
+                            self._start_response()
+                        return
+                    self._start_response()
+                    return
+                if phase is Stage.AWAITING_NO_PROJECT_EXAMPLE:
+                    await self._queue_speech(self.controller.explain_no_project_scope())
+                elif action == "END":
+                    await self._end_early(turn)
+                else:
+                    self._record(
+                        "no_project_waiting",
+                        speaker=None,
+                        guidance="Say end the interview, or return with a technical example.",
+                    )
+                return
+
             if not self._stop_latched and self.controller.stage is Stage.AWAITING_PROPOSAL:
                 started_at = time.perf_counter()
                 self._record(
@@ -810,7 +1075,9 @@ class InterviewSession:
                     llm_first_token_ms=None,
                     llm_first_token_basis="unavailable from structured run_inference",
                 )
+                inference_purpose = "decision"
                 result = await self._infer("decision", self._payload())
+                inference_returned = True
                 if generation != self._generation or self._closed:
                     self._record("inference_stale_discarded", speaker=None, generation=generation)
                     return
@@ -823,16 +1090,37 @@ class InterviewSession:
                 )
                 action = str(result.get("action", "")).upper()
                 text = result.get("text", "")
+                project_status = result.get("project_status")
                 self._record(
                     "decision_proposed",
                     speaker=None,
                     generation=generation,
                     action=action.lower(),
+                    project_status=project_status,
                     text=text if isinstance(text, str) else None,
                     remaining_follow_ups=self.controller.remaining_follow_ups,
                     remaining_clarifications=self.controller.remaining_clarifications,
                     validated=True,
                 )
+                if self.controller.current_question_number == 1 and action != "DETOUR":
+                    if project_status in {
+                        "technical_example",
+                        "no_example",
+                        "nontechnical",
+                        "unclear",
+                    }:
+                        self.controller.set_project_status(project_status)
+                    if project_status in {"no_example", "nontechnical"} or (
+                        project_status == "unclear"
+                        and action == "ADVANCE"
+                        and self.controller.project_established is not True
+                    ):
+                        await self._queue_speech(
+                            self.controller.offer_project_example(
+                                gentle=result.get("tone") == "gentle"
+                            )
+                        )
+                        return
                 if action == "WAIT":
                     self._record(
                         "awaiting_continuation", speaker=None, answer_number=self._answer_number
@@ -896,7 +1184,9 @@ class InterviewSession:
                     llm_first_token_ms=None,
                     llm_first_token_basis="unavailable from structured run_inference",
                 )
+                inference_purpose = "feedback"
                 result = await self._infer("feedback", self._payload())
+                inference_returned = True
                 if generation != self._generation or self._closed:
                     self._record("inference_stale_discarded", speaker=None, generation=generation)
                     return
@@ -922,7 +1212,9 @@ class InterviewSession:
                     llm_first_token_ms=None,
                     llm_first_token_basis="unavailable from structured run_inference",
                 )
+                inference_purpose = "early_feedback"
                 result = await self._infer("early_feedback", self._payload())
+                inference_returned = True
                 if generation != self._generation or self._closed:
                     self._record("inference_stale_discarded", speaker=None, generation=generation)
                     return
@@ -940,6 +1232,29 @@ class InterviewSession:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if (
+                opening_turn is not None
+                and self.controller.stage in {Stage.AWAITING_NAME, Stage.AWAITING_READINESS}
+                and generation == self._generation
+            ):
+                self._opening_interpret_text = None
+                self._record(
+                    "response_error",
+                    speaker=None,
+                    error_type=type(exc).__name__,
+                    failure_stage="opening_intent",
+                    recoverable=True,
+                )
+                if "name" in opening_turn.lower() and "you" in opening_turn.lower():
+                    name = _preferred_name(
+                        opening_turn, prompted=self.controller.stage is Stage.AWAITING_NAME
+                    )
+                    await self._queue_speech(
+                        self.controller.answer_opening_question("You can call me RehearseAI.", name)
+                    )
+                else:
+                    await self._route_opening(opening_turn, allow_interpretation=False)
+                return
             if (
                 self.controller.stage is Stage.AWAITING_OPENING_ACK
                 and generation == self._generation
@@ -961,7 +1276,19 @@ class InterviewSession:
                     )
                 )
             else:
-                self._record("response_error", speaker=None, error_type=type(exc).__name__)
+                self._record(
+                    "response_error",
+                    speaker=None,
+                    error_type=type(exc).__name__,
+                    failure_stage=(
+                        "inference_request"
+                        if not inference_returned
+                        else "structured_response_validation"
+                        if isinstance(exc, (ValueError, KeyError, TypeError))
+                        else "application_state"
+                    ),
+                    inference_purpose=inference_purpose,
+                )
                 if self.controller.stage is Stage.EARLY_CLOSING and generation == self._generation:
                     await self._queue_speech(
                         self.controller.prepare_early_feedback(
@@ -974,20 +1301,61 @@ class InterviewSession:
         if pending is None or pending.id != utterance_id or context_id is None:
             return
         self._tts_contexts[context_id] = utterance_id
+        self._tts_context_history[context_id] = utterance_id
         self._record(
             "tts_started", speaker=None, utterance_id=utterance_id, tts_context_id=context_id
         )
 
-    def pipeline_error(self, *, processor: str | None, category: str | None) -> None:
-        if not self._closed:
+    def pipeline_error(
+        self,
+        *,
+        processor: str | None,
+        category: str | None,
+        error: str | None = None,
+        exception_type: str | None = None,
+    ) -> None:
+        if self._closed:
+            return
+        match = re.fullmatch(r"TTS context ([0-9a-f-]+) completed with no audio", error or "")
+        context_id = match.group(1) if match else None
+        utterance_id = (
+            self._tts_context_history.get(context_id)
+            if context_id
+            else self.controller.pending.id
+            if self.controller.pending
+            else None
+        )
+        if context_id and (
+            self.controller.pending is None or self.controller.pending.id != utterance_id
+        ):
             self._record(
-                "response_error",
+                "stale_pipeline_error_ignored",
                 speaker=None,
-                failure_stage="pipeline",
                 processor=processor,
-                category=category,
-                utterance_id=self.controller.pending.id if self.controller.pending else None,
+                tts_context_id=context_id,
+                utterance_id=utterance_id,
             )
+            return
+        if match:
+            code = "tts_context_no_audio"
+        elif processor == "OpenAITTSService" and error and "Error getting audio" in error:
+            code = "tts_provider_response"
+        else:
+            code = "pipeline_error"
+        status_match = re.search(r"status:\s*(\d{3})", error or "")
+        self._record(
+            "response_error",
+            speaker=None,
+            failure_stage="pipeline",
+            processor=processor,
+            category=category,
+            error_code=code,
+            exception_type=exception_type,
+            provider_status=(status_match.group(1) if status_match else None),
+            tts_context_id=context_id,
+            utterance_id=utterance_id,
+            recoverable=bool(match),
+        )
 
     def tts_first_audio(self, context_id: str | None) -> None:
         utterance_id = self._tts_contexts.get(context_id or "")
@@ -1060,6 +1428,15 @@ class InterviewSession:
         self._speaking_id = None
         if self.controller.delivery_finished(pending.id):
             self._last_delivered_prompt = pending
+            if pending.kind in {
+                UtteranceKind.QUESTION,
+                UtteranceKind.FOLLOW_UP,
+                UtteranceKind.NUDGE,
+                UtteranceKind.CLARIFICATION,
+                UtteranceKind.REPEAT,
+                UtteranceKind.DETOUR_RESUME,
+            }:
+                self._last_project_prompt = pending
             self._record(
                 "agent_delivery_reported",
                 speaker="agent",
@@ -1076,6 +1453,9 @@ class InterviewSession:
             elif self.controller.stage is Stage.AWAITING_QUESTION_START:
                 next_question = self.controller.begin_question_one()
                 asyncio.create_task(self._queue_speech(next_question))
+            elif self.controller.stage is Stage.AWAITING_OPENING_RETURN:
+                next_prompt = self.controller.resume_opening_question()
+                asyncio.create_task(self._queue_speech(next_prompt))
             elif self.controller.stage is Stage.AWAITING_DETOUR_RETURN:
                 next_utterance = self.controller.resume_detour()
                 if next_utterance is None:

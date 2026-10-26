@@ -10,4 +10,10 @@ The decision call receives the current fixed question, `current_question_answer`
 
 The real session `sessions/88284b02-e5ae-437f-95ef-2c5dd1e4edd0.jsonl` shows the candidate asking “Okay. So you'll not ask me my name?” after question one. The prior decision produced a project nudge instead of addressing the question. The next name-related turn produced a clarification about the project question. This iteration gives name collection its own Python state and instructs the decision prompt to distinguish other coach-directed questions from project answers. Mocked routing tests cover the new control path. Whether the updated prompt reliably recognizes conversational detours in real speech remains untested.
 
+## Current routing and project-example prompt
+
+The same versioned `decision.txt` now receives a `phase` (`name`, `readiness`, `interview`, or one of two no-project recovery phases), `project_established`, the complete accumulated current answer, and the latest turn. Its validated schema adds `project_status` (`technical_example`, `no_example`, `nontechnical`, `unclear`) and `tone` (`neutral`, `gentle`). Python handles clear stop, repeat, and skip requests before inference. A direct question about the coach's name has a fixed answer; other opening questions use one structured decision call only when needed. During project questions, the existing decision call identifies conversational detours, so no extra intent request is added there. Python validates the decision and blocks a move from question one to dependent questions when the candidate has no technical example. One alternative invitation and one scope explanation bound the recovery. The early-closing prompt explicitly forbids invented project praise when the candidate stops without an example.
+
+No new prompt experiment has been run. Mocked decisions test Python routing, not the real model's classification or spoken quality.
+
 Offline tests check prompt loading, structured schemas, and routing. They do not establish how naturally the acknowledgement or TTS style sounds. A real listening comparison remains pending.

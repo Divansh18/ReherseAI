@@ -51,12 +51,17 @@ DECISION_SCHEMA = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["follow_up", "nudge", "clarification", "wait", "advance", "detour"],
+            "enum": ["follow_up", "nudge", "clarification", "wait", "advance", "detour", "end"],
         },
         "text": {"type": "string"},
         "project_fragment": {"type": "string"},
+        "project_status": {
+            "type": "string",
+            "enum": ["technical_example", "no_example", "nontechnical", "unclear"],
+        },
+        "tone": {"type": "string", "enum": ["neutral", "gentle"]},
     },
-    "required": ["action", "text", "project_fragment"],
+    "required": ["action", "text", "project_fragment", "project_status", "tone"],
     "additionalProperties": False,
 }
 FEEDBACK_SCHEMA = {
@@ -288,7 +293,12 @@ class LiveSession:
         async def pipeline_error(_worker: PipelineWorker, frame: Any) -> None:
             category = frame.category.value if frame.category is not None else None
             processor = type(frame.processor).__name__ if frame.processor is not None else None
-            self.session.pipeline_error(processor=processor, category=category)
+            self.session.pipeline_error(
+                processor=processor,
+                category=category,
+                error=frame.error,
+                exception_type=(type(frame.exception).__name__ if frame.exception else None),
+            )
 
         @transport.event_handler("on_client_connected")
         async def connected(_transport: SmallWebRTCTransport, _client: Any) -> None:
@@ -303,7 +313,12 @@ class LiveSession:
             await self.runner.add_workers(self.worker)
             await self.runner.run()
         except Exception:
-            self.session.pipeline_error(processor="PipelineWorker", category="unexpected_failure")
+            self.session.pipeline_error(
+                processor="PipelineWorker",
+                category="unexpected_failure",
+                error="Pipeline worker stopped unexpectedly",
+                exception_type=None,
+            )
             raise
         finally:
             await self.session.close()

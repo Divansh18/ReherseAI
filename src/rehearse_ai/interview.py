@@ -17,6 +17,18 @@ READINESS_CLARIFICATION = (
     "I didn't catch whether you're ready. Say 'start' when you are, or 'not yet' "
     "if you need a moment."
 )
+PROJECT_INVITATION = (
+    "A coursework project, small script, or another technical task would work too. "
+    "Is there one you'd like to use?"
+)
+GENTLE_PROJECT_INVITATION = (
+    "I'm sorry it's feeling that way. We can pause, or use a small script, "
+    "coursework project, or another technical task. Would you like to try one?"
+)
+NO_PROJECT_SCOPE = (
+    "This practice needs a technical example to build on. "
+    "We can end here, or you can return when one comes to mind."
+)
 
 MAX_FOLLOW_UPS_PER_QUESTION = 1
 MAX_CLARIFICATIONS_PER_QUESTION = 1
@@ -29,11 +41,14 @@ class Stage(Enum):
     AWAITING_GREETING = auto()
     AWAITING_OPENING_ACK = auto()
     AWAITING_NAME = auto()
+    AWAITING_OPENING_RETURN = auto()
     AWAITING_DETOUR_RETURN = auto()
     AWAITING_QUESTION_START = auto()
     AWAITING_READINESS = auto()
     AWAITING_ANSWER = auto()
     AWAITING_PROPOSAL = auto()
+    AWAITING_NO_PROJECT_EXAMPLE = auto()
+    AWAITING_NO_PROJECT_CHOICE = auto()
     AWAITING_FEEDBACK = auto()
     EARLY_CLOSING = auto()
     COMPLETE = auto()
@@ -58,6 +73,7 @@ class UtteranceKind(Enum):
     GREETING = auto()
     NAME_PROMPT = auto()
     NAME_ACK = auto()
+    OPENING_COACH_REPLY = auto()
     DETOUR_ACK = auto()
     DETOUR_RESUME = auto()
     OPENING_ACK = auto()
@@ -69,6 +85,8 @@ class UtteranceKind(Enum):
     NUDGE = auto()
     CLARIFICATION = auto()
     REPEAT = auto()
+    NO_PROJECT_INVITE = auto()
+    NO_PROJECT_SCOPE = auto()
     FEEDBACK = auto()
     EARLY_FEEDBACK = auto()
 
@@ -113,6 +131,10 @@ class InterviewController:
         self._name_repeats = 0
         self._detour_resume_prompt: Utterance | None = None
         self._detours = [0] * len(QUESTIONS)
+        self._opening_return_to_name = False
+        self._opening_coach_replies = 0
+        self._project_established: bool | None = None
+        self._no_project_repeats = 0
         self._opening_repeats = {Stage.AWAITING_GREETING: 0, Stage.AWAITING_READINESS: 0}
         self._readiness_nudges = 0
         self._readiness_clarifications = 0
@@ -156,6 +178,10 @@ class InterviewController:
     @property
     def name_declined(self) -> bool:
         return self._name_declined
+
+    @property
+    def project_established(self) -> bool | None:
+        return self._project_established
 
     @property
     def remaining_detours(self) -> int:
@@ -252,6 +278,28 @@ class InterviewController:
                 UtteranceKind.OPENING_WAIT, f"{acknowledgement} {READINESS_WAIT}", None
             )
         return self._prepare(UtteranceKind.READINESS, f"{acknowledgement} {READINESS_PROMPT}", None)
+
+    def answer_opening_question(self, reply: str, name: str | None = None) -> Utterance:
+        if self._stage not in {Stage.AWAITING_NAME, Stage.AWAITING_READINESS}:
+            raise InvalidTransition("Opening question is no longer pending")
+        if not reply.strip() or len(reply) > 120 or "?" in reply or "\n" in reply:
+            raise ValueError("Coach reply must be a short statement")
+        self._opening_return_to_name = self._stage is Stage.AWAITING_NAME and name is None
+        self._opening_coach_replies += 1
+        if name:
+            self.remember_name(name)
+            reply = f"Nice to meet you, {name}. {reply.strip()}"
+        return self._prepare(UtteranceKind.OPENING_COACH_REPLY, reply.strip(), None)
+
+    def resume_opening_question(self) -> Utterance:
+        self._require(Stage.AWAITING_OPENING_RETURN)
+        if self._opening_return_to_name and self._opening_coach_replies < 2:
+            return self._prepare(UtteranceKind.NAME_PROMPT, NAME_PROMPT, None)
+        return self._prepare(UtteranceKind.READINESS, READINESS_PROMPT, None)
+
+    def start_after_opening_question(self) -> Utterance:
+        self._require(Stage.AWAITING_OPENING_RETURN)
+        return self._prepare(UtteranceKind.QUESTION, QUESTIONS[0], 0)
 
     def retry_name_prompt(self) -> Utterance:
         self._require(Stage.AWAITING_NAME)
@@ -376,14 +424,75 @@ class InterviewController:
         self._stage = Stage.AWAITING_PROPOSAL
         return None
 
-    def request_repeat(self) -> Utterance:
-        """Repeat the current main question, spending its clarification budget."""
-        self._require(Stage.AWAITING_ANSWER)
+    def request_repeat(self, active_prompt: Utterance | None = None) -> Utterance:
+        """Repeat the active prompt, spending only the clarification allowance."""
+        if self._stage not in {Stage.AWAITING_ANSWER, Stage.AWAITING_PROPOSAL}:
+            raise InvalidTransition("There is no project prompt to repeat")
         index = self._question_index
         if self._clarifications[index] >= MAX_CLARIFICATIONS_PER_QUESTION:
             raise LimitReached("Clarification limit reached for this question")
         self._clarifications[index] += 1
-        return self._prepare(UtteranceKind.REPEAT, QUESTIONS[index], index)
+        text = (
+            active_prompt.text
+            if active_prompt and active_prompt.question_number == index + 1
+            else QUESTIONS[index]
+        )
+        return self._prepare(UtteranceKind.REPEAT, text, index)
+
+    def set_project_status(self, status: str) -> None:
+        if status == "technical_example":
+            self._project_established = True
+        elif status in {"no_example", "nontechnical"} and self._question_index == 0:
+            self._project_established = False
+        elif (
+            status == "unclear" and self._question_index == 0 and self._project_established is None
+        ):
+            self._project_established = False
+
+    def offer_project_example(self, *, gentle: bool = False) -> Utterance:
+        if self._stage not in {Stage.AWAITING_PROPOSAL, Stage.AWAITING_ANSWER}:
+            raise InvalidTransition("Project recovery is not pending")
+        if self._question_index != 0 or self._project_established is True:
+            raise InvalidTransition("Project recovery is not applicable")
+        self._project_established = False
+        return self._prepare(
+            UtteranceKind.NO_PROJECT_INVITE,
+            GENTLE_PROJECT_INVITATION if gentle else PROJECT_INVITATION,
+            0,
+        )
+
+    def explain_no_project_scope(self) -> Utterance:
+        self._require(Stage.AWAITING_NO_PROJECT_EXAMPLE)
+        return self._prepare(UtteranceKind.NO_PROJECT_SCOPE, NO_PROJECT_SCOPE, 0)
+
+    def repeat_no_project_prompt(self) -> Utterance:
+        if self._stage not in {
+            Stage.AWAITING_NO_PROJECT_EXAMPLE,
+            Stage.AWAITING_NO_PROJECT_CHOICE,
+        }:
+            raise InvalidTransition("No project recovery prompt is active")
+        if self._no_project_repeats >= 1:
+            raise LimitReached("No-project repeat limit reached")
+        self._no_project_repeats += 1
+        kind = (
+            UtteranceKind.NO_PROJECT_INVITE
+            if self._stage is Stage.AWAITING_NO_PROJECT_EXAMPLE
+            else UtteranceKind.NO_PROJECT_SCOPE
+        )
+        text = PROJECT_INVITATION if kind is UtteranceKind.NO_PROJECT_INVITE else NO_PROJECT_SCOPE
+        return self._prepare(kind, text, 0)
+
+    def accept_project_example(self, text: str) -> None:
+        if self._stage not in {
+            Stage.AWAITING_NO_PROJECT_EXAMPLE,
+            Stage.AWAITING_NO_PROJECT_CHOICE,
+        }:
+            raise InvalidTransition("No project example was requested")
+        if not text.strip():
+            raise ValueError("Project example cannot be empty")
+        self._project_established = True
+        self._answers[0].append(text.strip())
+        self._stage = Stage.AWAITING_PROPOSAL
 
     def propose(self, kind: ReplyKind, text: str | None = None) -> Utterance | None:
         """Accept a bounded LLM proposal; Python selects the next question."""
@@ -394,6 +503,8 @@ class InterviewController:
         if kind is ReplyKind.ADVANCE:
             if text is not None:
                 raise ValueError("ADVANCE cannot supply speech text")
+            if index == 0 and self._project_established is False:
+                raise InvalidTransition("A technical example is needed before dependent questions")
             if index == len(QUESTIONS) - 1:
                 self._stage = Stage.AWAITING_FEEDBACK
                 return None
@@ -442,6 +553,8 @@ class InterviewController:
     def skip_current(self) -> Utterance | None:
         """Advance on an explicit skip without recording a fabricated answer."""
         self._require(Stage.AWAITING_ANSWER)
+        if self._question_index == 0 and self._project_established is not True:
+            raise InvalidTransition("Cannot skip to a dependent question without a project")
         if self._question_index == len(QUESTIONS) - 1:
             self._stage = Stage.AWAITING_FEEDBACK
             return None
@@ -509,8 +622,14 @@ class InterviewController:
             self._stage = Stage.AWAITING_QUESTION_START
         elif utterance.kind is UtteranceKind.NAME_PROMPT:
             self._stage = Stage.AWAITING_NAME
+        elif utterance.kind is UtteranceKind.OPENING_COACH_REPLY:
+            self._stage = Stage.AWAITING_OPENING_RETURN
         elif utterance.kind is UtteranceKind.DETOUR_ACK:
             self._stage = Stage.AWAITING_DETOUR_RETURN
+        elif utterance.kind is UtteranceKind.NO_PROJECT_INVITE:
+            self._stage = Stage.AWAITING_NO_PROJECT_EXAMPLE
+        elif utterance.kind is UtteranceKind.NO_PROJECT_SCOPE:
+            self._stage = Stage.AWAITING_NO_PROJECT_CHOICE
         elif utterance.kind in {
             UtteranceKind.READINESS,
             UtteranceKind.OPENING_WAIT,
@@ -568,10 +687,16 @@ class InterviewController:
             self._stage = Stage.AWAITING_QUESTION_START
         elif interrupted.kind is UtteranceKind.NAME_PROMPT:
             self._stage = Stage.AWAITING_NAME
+        elif interrupted.kind is UtteranceKind.OPENING_COACH_REPLY:
+            self._stage = Stage.AWAITING_OPENING_RETURN
         elif interrupted.kind is UtteranceKind.NAME_ACK:
             self._stage = Stage.AWAITING_QUESTION_START
         elif interrupted.kind is UtteranceKind.DETOUR_ACK:
             self._stage = Stage.AWAITING_DETOUR_RETURN
+        elif interrupted.kind is UtteranceKind.NO_PROJECT_INVITE:
+            self._stage = Stage.AWAITING_NO_PROJECT_EXAMPLE
+        elif interrupted.kind is UtteranceKind.NO_PROJECT_SCOPE:
+            self._stage = Stage.AWAITING_NO_PROJECT_CHOICE
         elif interrupted.kind in {
             UtteranceKind.READINESS,
             UtteranceKind.OPENING_WAIT,

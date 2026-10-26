@@ -279,12 +279,13 @@ def test_skip_interrupted_question_is_explicit_and_does_not_record_answer() -> N
     controller = InterviewController()
     first = begin_questions(controller)
     assert controller.interrupt(first.id)
-    second = controller.skip_interrupted()
-    assert second.text == QUESTIONS[1]
+    with pytest.raises(InvalidTransition):
+        controller.skip_interrupted()
     assert controller.answers == ((), (), (), ())
     assert controller.current_question_number == 1
-    deliver(controller, second)
-    assert controller.current_question_number == 2
+    assert controller.stage is Stage.AWAITING_ANSWER
+    invitation = controller.offer_project_example()
+    assert invitation.kind is UtteranceKind.NO_PROJECT_INVITE
 
 
 def test_feedback_must_be_two_or_three_actual_lines() -> None:

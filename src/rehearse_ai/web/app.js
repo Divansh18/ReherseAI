@@ -23,10 +23,29 @@ function status(message, mic = 'Microphone off', active = false) {
   statusDot.classList.toggle('active', active);
 }
 
-function showError(message) {
+function showError(message, microphoneActive = false) {
   errorLabel.textContent = message;
   errorLabel.hidden = false;
-  status('Connection needs attention');
+  errorLabel.dataset.kind = 'error';
+  status(
+    microphoneActive ? 'Response needs attention' : 'Connection needs attention',
+    microphoneActive ? 'Microphone on' : 'Microphone off',
+    microphoneActive,
+  );
+}
+
+function showWarning(message) {
+  errorLabel.textContent = message;
+  errorLabel.hidden = false;
+  errorLabel.dataset.kind = 'warning';
+  status('Waiting for audio…', 'Microphone on', true);
+}
+
+function clearWarning() {
+  if (errorLabel.dataset.kind === 'warning') {
+    errorLabel.hidden = true;
+    delete errorLabel.dataset.kind;
+  }
 }
 
 function addTurn(speaker, text, id = null) {
@@ -53,6 +72,7 @@ function handleEvent(message) {
   if (entry.event === 'session_started') {
     document.querySelector('#session-id').textContent = `Session ${entry.session_id}`;
   } else if (entry.event === 'agent_prepared') {
+    clearWarning();
     prepared.set(entry.utterance_id, entry);
     status(
       entry.utterance_kind === 'question' && entry.question_number === 1
@@ -61,6 +81,7 @@ function handleEvent(message) {
       'Microphone on', true,
     );
   } else if (entry.event === 'agent_output_started') {
+    clearWarning();
     const item = prepared.get(entry.utterance_id);
     if (!item) return;
     addTurn('agent', item.text, entry.utterance_id);
@@ -77,6 +98,7 @@ function handleEvent(message) {
     item?.classList.add('interrupted');
     status('Listening…', 'Microphone on', true);
   } else if (entry.event === 'agent_delivery_reported') {
+    clearWarning();
     utterances.get(entry.utterance_id)?.classList.remove('prepared');
     const item = utterances.get(entry.utterance_id);
     if (item) item.querySelector('.speaker').textContent = 'Coach · server output complete';
@@ -108,8 +130,20 @@ function handleEvent(message) {
     );
   } else if (entry.event === 'opening_waiting_for_readiness') {
     status('Say “start” when ready, or “end the interview” to stop', 'Microphone on', true);
+  } else if (entry.event === 'no_project_waiting') {
+    status('Return with a technical example, or say “end the interview”', 'Microphone on', true);
+  } else if (entry.event === 'no_project_repeat_limit' || entry.event === 'project_example_required') {
+    status('Use a technical example, or say “end the interview”', 'Microphone on', true);
   } else if (entry.event === 'response_error') {
-    showError('The voice service could not complete a response. End and restart this session.');
+    if (entry.error_code === 'tts_context_no_audio') {
+      showWarning('The voice service returned no audio. You can speak to retry the prompt.');
+    } else if (entry.failure_stage === 'opening_inference' || entry.failure_stage === 'opening_intent') {
+      showWarning('The coach is recovering from a planning error. You can keep speaking.');
+    } else if (entry.failure_stage === 'pipeline' && entry.processor === 'OpenAITTSService') {
+      showError('The voice provider could not generate audio. Try speaking again; end the session if it persists.', true);
+    } else {
+      showError('The coach could not complete a response. Try speaking again or end the session.', true);
+    }
   }
 }
 

@@ -288,7 +288,7 @@ async def test_spoken_stop_latches_during_new_phases(tmp_path, phase):
 
 
 @pytest.mark.asyncio
-async def test_interrupted_name_prompt_retries_unheard_then_accepts_reply(tmp_path):
+async def test_interrupted_name_prompt_accepts_explicit_name_without_stale_delivery(tmp_path):
     session, adapter, spoken, _calls, _log = make_session(tmp_path)
     await session.start()
     deliver(session)
@@ -296,17 +296,10 @@ async def test_interrupted_name_prompt_retries_unheard_then_accepts_reply(tmp_pa
     await settle()
     first = session.controller.pending
     await turn(adapter, "Divansh.")
-    assert spoken[-1].kind is UtteranceKind.NAME_PROMPT
+    assert spoken[-1].kind is UtteranceKind.READINESS
     assert spoken[-1].id != first.id
     assert not session.controller.delivery_finished(first.id)
-    current = session.controller.pending
-    session.tts_started(current.id, "name")
-    session.tts_first_audio("name")
-    session.bot_started()
-    await turn(adapter, "Divansh.")
     assert session.controller.preferred_name == "Divansh"
-    assert spoken[-1].kind is UtteranceKind.READINESS
-    assert not session.controller.delivery_finished(current.id)
     await session.close()
 
 
