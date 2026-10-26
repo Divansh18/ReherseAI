@@ -288,9 +288,10 @@ async def test_tts_no_audio_error_is_correlated_and_not_mistaken_for_delivery(tm
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("spent_probe_action", ["clarification", "wait"])
 @pytest.mark.parametrize("final_action", ["clarification", "wait", "advance"])
 async def test_latest_session_project_probes_are_bounded_and_question_four_closes(
-    tmp_path, final_action
+    tmp_path, final_action, spent_probe_action
 ):
     calls = []
 
@@ -319,8 +320,10 @@ async def test_latest_session_project_probes_are_bounded_and_question_four_close
             }
         if number == 1:
             return {
-                "action": "clarification",
-                "text": "What do you mean by booking?",
+                "action": spent_probe_action,
+                "text": "What do you mean by booking?"
+                if spent_probe_action == "clarification"
+                else "",
                 "project_status": "technical_example",
             }
         if number == 2:
@@ -333,8 +336,12 @@ async def test_latest_session_project_probes_are_bounded_and_question_four_close
             }
         if number == 3:
             return {
-                "action": "clarification",
-                "text": "Could you share an example or metric?",
+                "action": spent_probe_action,
+                "text": (
+                    "Could you share an example or metric?"
+                    if spent_probe_action == "clarification"
+                    else ""
+                ),
                 "project_status": "unclear",
             }
         if len(payload["current_question_answers"]) == 1:
@@ -411,7 +418,9 @@ async def test_latest_session_project_probes_are_bounded_and_question_four_close
             if event["event"] == "proposal_rejected"
             and event.get("reason") == "project_probe_limit"
         ]
-    ) >= (3 if final_action == "clarification" else 2)
+    ) >= (2 if spent_probe_action == "clarification" else 0) + (
+        1 if final_action == "clarification" else 0
+    )
 
 
 @pytest.mark.asyncio

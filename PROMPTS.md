@@ -25,6 +25,15 @@ The real session `sessions/ec438fc5-14a2-4cac-b0df-076ccd16b70a.jsonl` (build `0
 | Q4 after “What would you do differently now?”: “Definitely now on what?” | Detour: “You can call me RehearseAI…” | Explain that the question concerns what the candidate would change in the project |
 | Q4 after the backup-model follow-up: “Because of the fact that backup model will be more good.” | Ask another clarification about the backup model | Advance to 2–3 sentence feedback based on collected answers |
 
-Routing regressions use these turns with mocked decisions to check the Python gates. A fresh text-model evaluation against the updated prompt requires sending these session-derived excerpts to OpenAI. Automatic approval review blocked that external request pending explicit user approval, so there is no new live-model result to report yet. The updated prompt's classification and spoken quality remain unverified.
+With explicit user approval, four bounded text-only calls ran through the versioned `decision.txt` prompt, the production `inference_adapter`, and the configured OpenAI `gpt-4.1-mini` model. Payloads reconstructed the active question, accumulated answer, latest turn, last project prompt, and spent probe allowance from the real session; they were not a replay of the WebRTC session. No audio was sent, and no key values were printed. Individual results:
+
+| Case | Model action and text | Request to validated response |
+| --- | --- | ---: |
+| Q1 “booking on it full time” after follow-up | `wait`, empty text | 1,599 ms |
+| Q3 checked it myself after metric follow-up | `wait`, empty text | 1,069 ms |
+| Q4 “Definitely now on what?” | `detour`: “Could you clarify what part you'd like me to elaborate on regarding what you'd do differently?” | 1,041 ms |
+| Q4 backup-model follow-up answer | `advance`, empty text | 1,332 ms |
+
+The model did not repeat the metric question or fixate on “booking” in these single calls, but its `wait` actions would still stall Q1 and Q3 if accepted literally. The updated Python route advances completed answers after a spent probe. The model still chose the wrong action type for the Q4 scope request; Python answers that request before model inference with the project-specific explanation. Q4 advancement matched the expected action. These four calls are a small prompt check, not a reliability estimate or evidence of spoken quality. Routing regressions cover the same actions with mocked decisions; a new microphone session must verify the full conversation and generated feedback.
 
 Offline tests check prompt loading, structured schemas, and routing. They do not establish how naturally the acknowledgement or TTS style sounds. A real listening comparison remains pending.
