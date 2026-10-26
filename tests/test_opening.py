@@ -14,9 +14,11 @@ from rehearse_ai.interview import (
     QUESTIONS,
     READINESS_CLARIFICATION,
     READINESS_PROMPT,
+    READINESS_WAIT,
     InterviewController,
     InvalidTransition,
     LimitReached,
+    Readiness,
     Stage,
     UtteranceKind,
 )
@@ -66,7 +68,7 @@ def harness(tmp_path, infer=None):
     async def default_infer(kind, payload):
         assert kind == "opening_ack"
         assert payload["greeting_response"]
-        return {"text": "Glad to hear that."}
+        return {"text": "Thanks for telling me."}
 
     async def speak(utterance):
         spoken.append(utterance)
@@ -110,6 +112,184 @@ def test_controller_requires_opening_delivery_and_bounds_prompts():
     assert controller.current_question_number == 1
 
 
+def test_ready_greeting_requires_ack_delivery_before_question_one():
+    controller = InterviewController()
+    greeting = controller.start()
+    assert controller.delivery_finished(greeting.id)
+    controller.submit_greeting("I'm good, let's start.")
+    acknowledgement = controller.prepare_readiness("Sounds good.", Readiness.READY)
+    assert acknowledgement.kind is UtteranceKind.OPENING_ACK
+    assert acknowledgement.text == "Sounds good."
+    assert controller.current_question_number is None
+    assert not controller.delivery_finished(greeting.id)
+    assert controller.delivery_finished(acknowledgement.id)
+    assert controller.stage is Stage.AWAITING_QUESTION_START
+    question = controller.begin_question_one()
+    assert question.text == QUESTIONS[0]
+    assert controller.current_question_number is None
+    assert controller.delivery_finished(question.id)
+    assert controller.current_question_number == 1
+
+
+@pytest.mark.parametrize(
+    ("greeting_response", "acknowledgement", "classification", "kind", "expected_text"),
+    [
+        (
+            "I'm doing great. How are you?",
+            "Doing well, thanks!",
+            "unclear",
+            UtteranceKind.READINESS,
+            "Doing well, thanks! Ready to jump in?",
+        ),
+        (
+            "A bit nervous.",
+            "That makes sense.",
+            "unclear",
+            UtteranceKind.READINESS,
+            "That makes sense. Ready to jump in?",
+        ),
+        (
+            "I'm good, let's start.",
+            "Sounds good.",
+            "ready",
+            UtteranceKind.OPENING_ACK,
+            "Sounds good.",
+        ),
+        (
+            "Not ready yet.",
+            "Of course.",
+            "deferred",
+            UtteranceKind.OPENING_WAIT,
+            f"Of course. {READINESS_WAIT}",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_short_contextual_opening_routes_greeting(
+    tmp_path, greeting_response, acknowledgement, classification, kind, expected_text
+):
+    calls = []
+
+    async def infer(purpose, payload):
+        calls.append((purpose, payload))
+        return {"text": acknowledgement}
+
+    session, adapter, spoken, log = harness(tmp_path, infer)
+    await session.start()
+    assert spoken[-1].text == GREETING
+    deliver(session)
+    await turn(adapter, greeting_response)
+    await settle()
+    assert calls[0][0] == "opening_ack"
+    assert calls[0][1]["greeting_response"] == greeting_response
+    assert calls[0][1]["greeting_readiness"] == classification
+    assert spoken[-1].kind is kind
+    assert spoken[-1].text == expected_text
+    assert "four questions" not in spoken[-1].text.lower()
+    assert session.controller.current_question_number is None
+    assert session.controller.answers == ((), (), (), ())
+    rows = [json.loads(line) for line in log.path.read_text().splitlines()]
+    assert [
+        row["classification"] for row in rows if row["event"] == "greeting_readiness_classified"
+    ] == [classification]
+    if kind is UtteranceKind.OPENING_ACK:
+        deliver(session)
+        await settle()
+        assert spoken[-1].text == QUESTIONS[0]
+        assert session.controller.current_question_number is None
+    elif kind is UtteranceKind.OPENING_WAIT:
+        deliver(session)
+        await turn(adapter, "Start.")
+        assert spoken[-1].text == QUESTIONS[0]
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_ready_greeting_ack_interruption_preserves_delivery_order(tmp_path):
+    session, adapter, spoken, _log = harness(tmp_path)
+    await session.start()
+    deliver(session)
+    await turn(adapter, "I'm good, let's start.")
+    await settle()
+    acknowledgement = session.controller.pending
+    assert acknowledgement.kind is UtteranceKind.OPENING_ACK
+    await turn(adapter, "Hello?")
+    assert spoken[-1].kind is UtteranceKind.OPENING_ACK
+    assert spoken[-1].id != acknowledgement.id
+    assert not any(item.kind is UtteranceKind.QUESTION for item in spoken)
+    retried = session.controller.pending
+    output_started(session)
+    await turn(adapter, "Go ahead.")
+    assert not session.controller.delivery_finished(retried.id)
+    assert spoken[-1].text == QUESTIONS[0]
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_end_after_ready_ack_drops_queued_question(tmp_path):
+    session, adapter, spoken, _log = harness(tmp_path)
+    await session.start()
+    deliver(session)
+    await turn(adapter, "I'm good, let's start.")
+    await settle()
+    assert session.controller.pending.kind is UtteranceKind.OPENING_ACK
+    deliver(session)
+    await session.close()
+    await settle()
+    assert not any(item.kind is UtteranceKind.QUESTION for item in spoken)
+
+
+@pytest.mark.asyncio
+async def test_ready_greeting_remains_ready_after_later_stt_segment(tmp_path):
+    session, adapter, spoken, log = harness(tmp_path)
+    await session.start()
+    deliver(session)
+    await turn(adapter, "I'm good, let's start.", "I have a project in mind.")
+    await settle()
+    assert (
+        session.controller.greeting_response == "I'm good, let's start. I have a project in mind."
+    )
+    assert spoken[-1].kind is UtteranceKind.OPENING_ACK
+    rows = [json.loads(line) for line in log.path.read_text().splitlines()]
+    assert [
+        row["classification"] for row in rows if row["event"] == "greeting_readiness_classified"
+    ] == ["ready"]
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_spoken_stop_during_greeting_preempts_opening_inference(tmp_path):
+    calls = []
+
+    async def infer(kind, payload):
+        calls.append((kind, payload))
+        return {"text": "This should not run."}
+
+    session, adapter, spoken, log = harness(tmp_path, infer)
+    await session.start()
+    await turn(adapter, "Can we end the interview?")
+    assert calls == []
+    assert session.controller.pending.kind is UtteranceKind.EARLY_FEEDBACK
+    assert not any(item.kind is UtteranceKind.QUESTION for item in spoken)
+    rows = [json.loads(line) for line in log.path.read_text().splitlines()]
+    assert any(row["event"] == "early_end_requested" for row in rows)
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_spoken_stop_during_ready_greeting_ack_blocks_question_one(tmp_path):
+    session, adapter, spoken, _log = harness(tmp_path)
+    await session.start()
+    deliver(session)
+    await turn(adapter, "I'm good, let's start.")
+    await settle()
+    assert session.controller.pending.kind is UtteranceKind.OPENING_ACK
+    await turn(adapter, "Stop the interview.")
+    assert session.controller.pending.kind is UtteranceKind.EARLY_FEEDBACK
+    assert not any(item.kind is UtteranceKind.QUESTION for item in spoken)
+    await session.close()
+
+
 @pytest.mark.asyncio
 async def test_greeting_ack_not_yet_repeat_then_ready_through_session_route(tmp_path):
     session, adapter, spoken, log = harness(tmp_path)
@@ -119,7 +299,7 @@ async def test_greeting_ack_not_yet_repeat_then_ready_through_session_route(tmp_
     await turn(adapter, "I'm doing okay, a little nervous.")
     await settle()
     assert spoken[-1].kind is UtteranceKind.READINESS
-    assert "Glad to hear that." in spoken[-1].text
+    assert "Thanks for telling me." in spoken[-1].text
     assert spoken[-1].text.endswith(READINESS_PROMPT)
     assert session.controller.current_question_number is None
     deliver(session)
@@ -405,12 +585,26 @@ async def test_opening_inference_failure_reports_error_and_uses_safe_ack(tmp_pat
     await turn(adapter, "I'm doing well.")
     await settle()
     assert spoken[-1].kind is UtteranceKind.READINESS
-    assert spoken[-1].text.startswith("Thanks for sharing.")
+    assert spoken[-1].text.startswith("Thanks for telling me.")
     rows = [json.loads(line) for line in log.path.read_text().splitlines()]
     assert any(
         row["event"] == "response_error" and row["failure_stage"] == "opening_inference"
         for row in rows
     )
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_how_are_you_fallback_answers_briefly_if_inference_fails(tmp_path):
+    async def infer(_kind, _payload):
+        raise RuntimeError("synthetic provider failure")
+
+    session, adapter, spoken, _log = harness(tmp_path, infer)
+    await session.start()
+    deliver(session)
+    await turn(adapter, "I'm doing great. How are you?")
+    await settle()
+    assert spoken[-1].text == "Doing well, thanks. Ready to jump in?"
     await session.close()
 
 
@@ -536,6 +730,8 @@ async def test_opening_ack_uses_versioned_prompt_and_structured_schema():
     )
     assert result == {"text": "Thanks for telling me."}
     assert calls[0][1]["system_instruction"] == load_prompt("opening_ack")
+    assert "If they ask how you are" in calls[0][1]["system_instruction"]
+    assert "Avoid parroting" in calls[0][1]["system_instruction"]
     assert calls[0][1]["response_schema"]["required"] == ["text"]
 
 
@@ -550,7 +746,7 @@ async def test_invalid_opening_ack_uses_bounded_fallback(tmp_path):
     await turn(adapter, "I'm okay.")
     await settle()
     assert spoken[-1].kind is UtteranceKind.READINESS
-    assert spoken[-1].text.startswith("Thanks for sharing.")
+    assert spoken[-1].text.startswith("Thanks for telling me.")
     assert spoken[-1].text.endswith(READINESS_PROMPT)
     rows = [json.loads(line) for line in log.path.read_text().splitlines()]
     assert any(row["event"] == "opening_ack_fallback" for row in rows)

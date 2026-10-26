@@ -4,12 +4,12 @@ import asyncio
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from enum import Enum, auto
 from typing import Any
 
 from rehearse_ai.interview import (
     InterviewController,
     LimitReached,
+    Readiness,
     ReplyKind,
     Stage,
     Utterance,
@@ -52,12 +52,6 @@ _WITHDRAW_CLAUSE = re.compile(
 )
 
 
-class Readiness(Enum):
-    READY = auto()
-    DEFERRED = auto()
-    UNCLEAR = auto()
-
-
 _DEFER_READINESS = re.compile(
     r"\b(?:not (?:ready|yet|now)|do not (?:start|begin)|do not want to"
     r"|give me (?:a |one )?(?:moment|minute|second)|need (?:a |one )?(?:moment|minute|second)"
@@ -92,6 +86,24 @@ def _classify_readiness(text: str) -> Readiness:
     ):
         return Readiness.READY
     return Readiness.UNCLEAR
+
+
+def _classify_greeting_readiness(text: str) -> Readiness:
+    classification = _classify_readiness(text)
+    if classification is not Readiness.UNCLEAR:
+        return classification
+    clauses = [_classify_readiness(clause) for clause in re.split(r"[.!?]+", text)]
+    if Readiness.DEFERRED in clauses:
+        return Readiness.DEFERRED
+    if Readiness.READY in clauses:
+        return Readiness.READY
+    return Readiness.UNCLEAR
+
+
+def _fallback_opening_ack(text: str) -> str:
+    if re.search(r"\bhow (?:are|r) you\b|\bhow's it going\b", text, re.I):
+        return "Doing well, thanks."
+    return "Thanks for telling me."
 
 
 def _is_stop_request(text: str) -> bool:
@@ -197,8 +209,10 @@ class InterviewSession:
         await self._queue_speech(self.controller.start())
 
     async def _queue_speech(self, utterance: Utterance) -> None:
-        if self.controller.pending != utterance or (
-            self._stop_latched and utterance.kind is not UtteranceKind.EARLY_FEEDBACK
+        if (
+            self._closed
+            or self.controller.pending != utterance
+            or (self._stop_latched and utterance.kind is not UtteranceKind.EARLY_FEEDBACK)
         ):
             return
         self._active_prompt_id = utterance.id
@@ -421,6 +435,7 @@ class InterviewSession:
         interrupted = self.controller.interrupted_utterance
         opening_kinds = {
             UtteranceKind.GREETING,
+            UtteranceKind.OPENING_ACK,
             UtteranceKind.READINESS,
             UtteranceKind.OPENING_WAIT,
             UtteranceKind.OPENING_CLARIFICATION,
@@ -463,6 +478,10 @@ class InterviewSession:
                 await self._queue_speech(utterance)
             else:
                 self._start_response()
+            return True
+
+        if self.controller.stage is Stage.AWAITING_QUESTION_START:
+            await self._queue_speech(self.controller.begin_question_one())
             return True
 
         if self.controller.stage is Stage.AWAITING_OPENING_ACK:
@@ -587,10 +606,19 @@ class InterviewSession:
     async def _respond(self, generation: int) -> None:
         try:
             if not self._stop_latched and self.controller.stage is Stage.AWAITING_OPENING_ACK:
+                greeting_readiness = _classify_greeting_readiness(self.controller.greeting_response)
+                self._record(
+                    "greeting_readiness_classified",
+                    speaker=None,
+                    classification=greeting_readiness.name.lower(),
+                )
                 self._record(
                     "inference_started", speaker=None, generation=generation, purpose="opening_ack"
                 )
-                result = await self._infer("opening_ack", self._payload())
+                result = await self._infer(
+                    "opening_ack",
+                    {**self._payload(), "greeting_readiness": greeting_readiness.name.lower()},
+                )
                 if generation != self._generation or self._closed:
                     self._record("inference_stale_discarded", speaker=None, generation=generation)
                     return
@@ -598,10 +626,14 @@ class InterviewSession:
                 if not isinstance(acknowledgement, str):
                     raise ValueError("Opening response did not contain text")
                 try:
-                    utterance = self.controller.prepare_readiness(acknowledgement)
+                    utterance = self.controller.prepare_readiness(
+                        acknowledgement, greeting_readiness
+                    )
                 except ValueError:
                     self._record("opening_ack_fallback", speaker=None, error_type="InvalidText")
-                    utterance = self.controller.prepare_readiness("Thanks for sharing.")
+                    utterance = self.controller.prepare_readiness(
+                        _fallback_opening_ack(self.controller.greeting_response), greeting_readiness
+                    )
                 self._record(
                     "inference_completed",
                     speaker=None,
@@ -736,7 +768,12 @@ class InterviewSession:
                     error_type=type(exc).__name__,
                     failure_stage="opening_inference",
                 )
-                await self._queue_speech(self.controller.prepare_readiness("Thanks for sharing."))
+                greeting_readiness = _classify_greeting_readiness(self.controller.greeting_response)
+                await self._queue_speech(
+                    self.controller.prepare_readiness(
+                        _fallback_opening_ack(self.controller.greeting_response), greeting_readiness
+                    )
+                )
             else:
                 self._record("response_error", speaker=None, error_type=type(exc).__name__)
                 if self.controller.stage is Stage.EARLY_CLOSING and generation == self._generation:
@@ -850,6 +887,9 @@ class InterviewSession:
                 self._record("interview_complete", speaker=None)
             elif self.controller.stage is Stage.ENDED_EARLY:
                 self._record("interview_ended_early", speaker=None)
+            elif self.controller.stage is Stage.AWAITING_QUESTION_START:
+                next_question = self.controller.begin_question_one()
+                asyncio.create_task(self._queue_speech(next_question))
 
     async def close(self) -> None:
         if self._closed:

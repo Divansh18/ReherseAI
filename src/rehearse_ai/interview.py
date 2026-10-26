@@ -9,12 +9,9 @@ QUESTIONS = (
     "How did you know it was working well?",
     "What would you do differently now?",
 )
-GREETING = "Hey, how are you doing today?"
-READINESS_PROMPT = (
-    "We'll go through four questions about your project, then I'll give you short feedback. "
-    "Are you ready to begin?"
-)
-READINESS_WAIT = "No rush. Tell me when you're ready to begin."
+GREETING = "Hey, how's it going?"
+READINESS_PROMPT = "Ready to jump in?"
+READINESS_WAIT = "Just let me know when you're ready."
 READINESS_CLARIFICATION = (
     "I didn't catch whether you're ready. Say 'start' when you are, or 'not yet' "
     "if you need a moment."
@@ -30,6 +27,7 @@ class Stage(Enum):
     DELIVERING = auto()
     AWAITING_GREETING = auto()
     AWAITING_OPENING_ACK = auto()
+    AWAITING_QUESTION_START = auto()
     AWAITING_READINESS = auto()
     AWAITING_ANSWER = auto()
     AWAITING_PROPOSAL = auto()
@@ -46,8 +44,15 @@ class ReplyKind(Enum):
     ADVANCE = auto()
 
 
+class Readiness(Enum):
+    READY = auto()
+    DEFERRED = auto()
+    UNCLEAR = auto()
+
+
 class UtteranceKind(Enum):
     GREETING = auto()
+    OPENING_ACK = auto()
     READINESS = auto()
     OPENING_WAIT = auto()
     OPENING_CLARIFICATION = auto()
@@ -160,7 +165,9 @@ class InterviewController:
         if continuation := text.strip():
             self._greeting_response = f"{self._greeting_response} {continuation}"
 
-    def prepare_readiness(self, acknowledgement: str) -> Utterance:
+    def prepare_readiness(
+        self, acknowledgement: str, greeting_readiness: Readiness = Readiness.UNCLEAR
+    ) -> Utterance:
         self._require(Stage.AWAITING_OPENING_ACK)
         acknowledgement = acknowledgement.strip()
         body = acknowledgement.rstrip(".! ")
@@ -175,7 +182,18 @@ class InterviewController:
             raise ValueError("Opening acknowledgement must be one short spoken line")
         if acknowledgement[-1] not in ".!?":
             acknowledgement += "."
+        if greeting_readiness is Readiness.READY:
+            return self._prepare(UtteranceKind.OPENING_ACK, acknowledgement, None)
+        if greeting_readiness is Readiness.DEFERRED:
+            self._readiness_nudges = 1
+            return self._prepare(
+                UtteranceKind.OPENING_WAIT, f"{acknowledgement} {READINESS_WAIT}", None
+            )
         return self._prepare(UtteranceKind.READINESS, f"{acknowledgement} {READINESS_PROMPT}", None)
+
+    def begin_question_one(self) -> Utterance:
+        self._require(Stage.AWAITING_QUESTION_START)
+        return self._prepare(UtteranceKind.QUESTION, QUESTIONS[0], 0)
 
     def submit_readiness(self, ready: bool) -> Utterance | None:
         self._require(Stage.AWAITING_READINESS)
@@ -346,6 +364,8 @@ class InterviewController:
         self._pending = None
         if utterance.kind is UtteranceKind.GREETING:
             self._stage = Stage.AWAITING_GREETING
+        elif utterance.kind is UtteranceKind.OPENING_ACK:
+            self._stage = Stage.AWAITING_QUESTION_START
         elif utterance.kind in {
             UtteranceKind.READINESS,
             UtteranceKind.OPENING_WAIT,
@@ -399,6 +419,8 @@ class InterviewController:
         if interrupted.kind is UtteranceKind.GREETING:
             self._greeting_response = answer
             self._stage = Stage.AWAITING_OPENING_ACK
+        elif interrupted.kind is UtteranceKind.OPENING_ACK:
+            self._stage = Stage.AWAITING_QUESTION_START
         elif interrupted.kind in {
             UtteranceKind.READINESS,
             UtteranceKind.OPENING_WAIT,
