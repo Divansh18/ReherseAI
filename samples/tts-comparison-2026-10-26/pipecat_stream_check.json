@@ -1,0 +1,36 @@
+{
+  "provider": "CartesiaTTSService via installed Pipecat 1.14.0 WebSocket",
+  "model": "sonic-3.6",
+  "voice": "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4",
+  "contexts": [
+    {
+      "label": "normal",
+      "context_id": "e35e03fa-a18a-4892-aa0f-0b6ee37eda34",
+      "provider_first_audio_ms": 103.3,
+      "sink_first_audio_ms": 103.9,
+      "audio_bytes_at_sink": 103680,
+      "cancelled": false,
+      "provider_finished": true
+    },
+    {
+      "label": "interrupted",
+      "context_id": "9ed36074-32c5-4e3e-a822-d2a9a81d9423",
+      "provider_first_audio_ms": 93.5,
+      "sink_first_audio_ms": 93.9,
+      "audio_bytes_at_sink": 7392,
+      "cancelled": true,
+      "provider_finished": true
+    },
+    {
+      "label": "fresh",
+      "context_id": "7eb10808-f295-4bbf-a16b-087448f4724d",
+      "provider_first_audio_ms": 105.1,
+      "sink_first_audio_ms": 105.3,
+      "audio_bytes_at_sink": 84480,
+      "cancelled": false,
+      "provider_finished": true
+    }
+  ],
+  "cancelled_context_audio_after_cancel": 0,
+  "errors": []
+}

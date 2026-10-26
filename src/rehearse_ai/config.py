@@ -1,6 +1,7 @@
 """Validated local runtime settings; secrets never enter browser responses."""
 
 import os
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,14 +17,18 @@ class ConfigurationError(ValueError):
 class Settings:
     deepgram_api_key: str = field(repr=False)
     openai_api_key: str = field(repr=False)
+    cartesia_api_key: str | None = field(default=None, repr=False)
     host: str = "127.0.0.1"
     port: int = 7860
     session_dir: Path = Path("sessions")
     stt_model: str = "nova-3-general"
     llm_model: str = "gpt-4.1-mini"
-    tts_model: str = "gpt-4o-mini-tts"
-    tts_voice: str = "shimmer"
-    tts_speed: float = 1.0
+    tts_provider: str = "cartesia"
+    cartesia_tts_model: str = "sonic-3.6"
+    cartesia_tts_voice: str = "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4"
+    openai_tts_model: str = "gpt-4o-mini-tts"
+    openai_tts_voice: str = "shimmer"
+    openai_tts_speed: float = 1.0
     vad_confidence: float = 0.7
     vad_start_secs: float = 0.2
     vad_stop_secs: float = 0.35
@@ -38,9 +43,16 @@ class Settings:
         file_values = dotenv_values(env_file)
         values = {key: value for key, value in file_values.items() if value is not None}
         values.update(os.environ if env is None else env)
+        provider = values.get("REHEARSE_TTS_PROVIDER", "cartesia").strip().lower()
+        if provider not in {"cartesia", "openai"}:
+            raise ConfigurationError("REHEARSE_TTS_PROVIDER must be cartesia or openai")
         missing = [
             name
-            for name in ("DEEPGRAM_API_KEY", "OPENAI_API_KEY")
+            for name in (
+                "DEEPGRAM_API_KEY",
+                "OPENAI_API_KEY",
+                *(("CARTESIA_API_KEY",) if provider == "cartesia" else ()),
+            )
             if not values.get(name, "").strip()
         ]
         if missing:
@@ -69,7 +81,6 @@ class Settings:
         model_options = {
             "REHEARSE_STT_MODEL": {"nova-3-general", "nova-3"},
             "REHEARSE_LLM_MODEL": {"gpt-4.1-mini", "gpt-4.1"},
-            "REHEARSE_TTS_MODEL": {"gpt-4o-mini-tts", "tts-1"},
         }
         for name, allowed in model_options.items():
             if values.get(name, next(iter(sorted(allowed)))) not in allowed:
@@ -89,11 +100,26 @@ class Settings:
             "shimmer",
             "verse",
         }
-        voice = values.get("REHEARSE_TTS_VOICE", "shimmer")
-        if voice not in voices:
-            raise ConfigurationError("REHEARSE_TTS_VOICE is not a supported OpenAI built-in voice")
-        tts_model = values.get("REHEARSE_TTS_MODEL", "gpt-4o-mini-tts")
-        if tts_model == "tts-1" and voice not in {
+        cartesia_model = values.get("REHEARSE_CARTESIA_TTS_MODEL", "sonic-3.6")
+        cartesia_voice = values.get(
+            "REHEARSE_CARTESIA_TTS_VOICE", "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4"
+        )
+        openai_model = values.get("REHEARSE_OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+        openai_voice = values.get("REHEARSE_OPENAI_TTS_VOICE", "shimmer")
+        if provider == "cartesia":
+            if cartesia_model != "sonic-3.6":
+                raise ConfigurationError("REHEARSE_CARTESIA_TTS_MODEL must be sonic-3.6")
+            try:
+                uuid.UUID(cartesia_voice)
+            except ValueError as exc:
+                raise ConfigurationError(
+                    "REHEARSE_CARTESIA_TTS_VOICE must be a voice UUID"
+                ) from exc
+        elif openai_model not in {"gpt-4o-mini-tts", "tts-1"}:
+            raise ConfigurationError("REHEARSE_OPENAI_TTS_MODEL is unsupported")
+        elif openai_voice not in voices:
+            raise ConfigurationError("REHEARSE_OPENAI_TTS_VOICE is unsupported")
+        elif openai_model == "tts-1" and openai_voice not in {
             "alloy",
             "ash",
             "coral",
@@ -104,19 +130,27 @@ class Settings:
             "shimmer",
             "sage",
         }:
-            raise ConfigurationError("REHEARSE_TTS_VOICE is unavailable with tts-1")
+            raise ConfigurationError("REHEARSE_OPENAI_TTS_VOICE is unavailable with tts-1")
 
         return cls(
             deepgram_api_key=values["DEEPGRAM_API_KEY"],
             openai_api_key=values["OPENAI_API_KEY"],
+            cartesia_api_key=values.get("CARTESIA_API_KEY") or None,
             host=host,
             port=port,
             session_dir=Path(values.get("REHEARSE_SESSION_DIR", "sessions")),
             stt_model=values.get("REHEARSE_STT_MODEL", "nova-3-general"),
             llm_model=values.get("REHEARSE_LLM_MODEL", "gpt-4.1-mini"),
-            tts_model=tts_model,
-            tts_voice=voice,
-            tts_speed=number("REHEARSE_TTS_SPEED", "1.0", low=0.25, high=4.0),
+            tts_provider=provider,
+            cartesia_tts_model=cartesia_model,
+            cartesia_tts_voice=cartesia_voice,
+            openai_tts_model=openai_model,
+            openai_tts_voice=openai_voice,
+            openai_tts_speed=(
+                number("REHEARSE_OPENAI_TTS_SPEED", "1.0", low=0.25, high=4.0)
+                if provider == "openai"
+                else 1.0
+            ),
             vad_confidence=number("REHEARSE_VAD_CONFIDENCE", "0.7", low=0.1, high=1.0),
             vad_start_secs=number("REHEARSE_VAD_START_SECS", "0.2", low=0.05, high=2.0),
             vad_stop_secs=number("REHEARSE_VAD_STOP_SECS", "0.35", low=0.1, high=2.0),

@@ -139,7 +139,7 @@ function handleEvent(message) {
       showWarning('The voice service returned no audio. You can speak to retry the prompt.');
     } else if (entry.failure_stage === 'opening_inference' || entry.failure_stage === 'opening_intent') {
       showWarning('The coach is recovering from a planning error. You can keep speaking.');
-    } else if (entry.failure_stage === 'pipeline' && entry.processor === 'OpenAITTSService') {
+    } else if (entry.failure_stage === 'pipeline' && ['OpenAITTSService', 'CartesiaTTSService'].includes(entry.processor)) {
       showError('The voice provider could not generate audio. Try speaking again; end the session if it persists.', true);
     } else {
       showError('The coach could not complete a response. Try speaking again or end the session.', true);

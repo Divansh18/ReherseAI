@@ -1,0 +1,94 @@
+{
+  "run_utc": "2026-10-26T16:58:32.946289+00:00",
+  "method": "Direct HTTPS streaming APIs; one POST per utterance; monotonic request-to-first-nonempty-PCM-byte and request-to-stream-end; no Pipecat or browser playback.",
+  "audio_format": {
+    "container": "raw_in_request_wav_on_disk",
+    "encoding": "pcm_s16le",
+    "sample_rate_hz": 24000,
+    "channels": 1
+  },
+  "openai": {
+    "model": "gpt-4o-mini-tts",
+    "voice": "shimmer",
+    "speed": 1.0,
+    "instructions_file": "src/rehearse_ai/prompts/tts_style.txt",
+    "endpoint": "/v1/audio/speech"
+  },
+  "cartesia": {
+    "model": "sonic-3.6",
+    "voice_name": "Skylar",
+    "voice_id": "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4",
+    "api_version": "2026-08-14",
+    "language": "en",
+    "generation_config": "default",
+    "endpoint": "/tts/bytes"
+  },
+  "results": [
+    {
+      "order": 1,
+      "line_number": 1,
+      "provider": "openai",
+      "text": "Tell me about a project you're proud of.",
+      "file": "01_openai.wav",
+      "first_audio_ms": 1277.8,
+      "total_ms": 2134.0,
+      "audio_bytes": 136800,
+      "error": null
+    },
+    {
+      "order": 2,
+      "line_number": 1,
+      "provider": "cartesia",
+      "text": "Tell me about a project you're proud of.",
+      "file": "01_cartesia.wav",
+      "first_audio_ms": 179.9,
+      "total_ms": 474.1,
+      "audio_bytes": 99840,
+      "error": null
+    },
+    {
+      "order": 3,
+      "line_number": 2,
+      "provider": "openai",
+      "text": "What was the hardest technical problem in it?",
+      "file": "02_openai.wav",
+      "first_audio_ms": 11717.3,
+      "total_ms": 12539.0,
+      "audio_bytes": 148800,
+      "error": null
+    },
+    {
+      "order": 4,
+      "line_number": 2,
+      "provider": "cartesia",
+      "text": "What was the hardest technical problem in it?",
+      "file": "02_cartesia.wav",
+      "first_audio_ms": 166.3,
+      "total_ms": 556.3,
+      "audio_bytes": 111360,
+      "error": null
+    },
+    {
+      "order": 5,
+      "line_number": 3,
+      "provider": "openai",
+      "text": "What would you do differently now?",
+      "file": "03_openai.wav",
+      "first_audio_ms": 1080.9,
+      "total_ms": 1872.2,
+      "audio_bytes": 117600,
+      "error": null
+    },
+    {
+      "order": 6,
+      "line_number": 3,
+      "provider": "cartesia",
+      "text": "What would you do differently now?",
+      "file": "03_cartesia.wav",
+      "first_audio_ms": 141.0,
+      "total_ms": 349.5,
+      "audio_bytes": 84480,
+      "error": null
+    }
+  ]
+}

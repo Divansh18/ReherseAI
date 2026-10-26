@@ -9,7 +9,7 @@ description = "RehearseAI local voice mock-interview coach"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "pipecat-ai[deepgram,openai,runner,webrtc]==1.14.0",
+    "pipecat-ai[cartesia,deepgram,openai,runner,webrtc]==1.14.0",
 ]
 
 [dependency-groups]

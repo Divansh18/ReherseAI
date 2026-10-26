@@ -1,10 +1,8 @@
 """Pipecat assembly; interview policy remains in the domain controller."""
 
-import asyncio
 import json
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import Any
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -12,10 +10,7 @@ from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
-    DataFrame,
-    ErrorFrame,
     Frame,
-    InterruptionFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
@@ -34,7 +29,6 @@ from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.openai.tts import OpenAITTSService
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.turns.user_start import TranscriptionUserTurnStartStrategy, VADUserTurnStartStrategy
@@ -47,9 +41,7 @@ from rehearse_ai.interview import Utterance
 from rehearse_ai.prompts import load_prompt
 from rehearse_ai.session import InterviewSession
 from rehearse_ai.session_log import SessionLog
-
-# Pipecat's 3-second default closed a real context before provider audio arrived at 9.7 seconds.
-TTS_CONTEXT_IDLE_SECS = 20.0
+from rehearse_ai.tts import UtteranceMarkerFrame, build_tts_service
 
 DECISION_SCHEMA = {
     "type": "object",
@@ -81,11 +73,6 @@ OPENING_SCHEMA = {
     "required": ["text"],
     "additionalProperties": False,
 }
-
-
-@dataclass
-class UtteranceMarkerFrame(DataFrame):
-    utterance_id: int
 
 
 class InterviewInput(FrameProcessor):
@@ -170,52 +157,22 @@ class AudioObserver(FrameProcessor):
     def __init__(self) -> None:
         super().__init__()
         self.session: InterviewSession | None = None
-        self._utterance_id: int | None = None
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if direction is FrameDirection.DOWNSTREAM and self.session is not None:
             if isinstance(frame, UtteranceMarkerFrame):
-                self._utterance_id = frame.utterance_id
                 return
-            if isinstance(frame, InterruptionFrame):
-                self._utterance_id = None
-            elif isinstance(frame, TTSStartedFrame) and self._utterance_id is not None:
-                self.session.tts_started(self._utterance_id, frame.context_id)
+            if isinstance(frame, TTSStartedFrame):
+                utterance_id = self.session.tts_context_utterance(frame.context_id)
+                if utterance_id is not None:
+                    self.session.tts_started(utterance_id, frame.context_id)
             elif isinstance(frame, TTSAudioRawFrame):
                 if not self.session.tts_audio_chunk(frame.context_id, len(frame.audio)):
                     return
             elif isinstance(frame, TTSStoppedFrame):
                 self.session.tts_finished(frame.context_id)
         await self.push_frame(frame, direction)
-
-
-class ObservedOpenAITTSService(OpenAITTSService):
-    """Record provider-yielded frames before Pipecat's context playback queue."""
-
-    def __init__(self, session: InterviewSession, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._session = session
-
-    async def run_tts(self, text: str, context_id: str):
-        self._session.provider_tts_requested(context_id, len(text))
-        try:
-            async for frame in super().run_tts(text, context_id):
-                if isinstance(frame, TTSAudioRawFrame):
-                    self._session.provider_tts_audio_chunk(context_id, len(frame.audio))
-                elif isinstance(frame, ErrorFrame):
-                    self._session.provider_tts_error(context_id, frame.error, None)
-                yield frame
-        except asyncio.CancelledError:
-            self._session.provider_tts_cancelled(context_id)
-            raise
-        except Exception as exc:
-            self._session.provider_tts_error(
-                context_id, type(exc).__name__, getattr(exc, "status_code", None)
-            )
-            raise
-        finally:
-            self._session.provider_tts_finished(context_id)
 
 
 def inference_adapter(llm: OpenAILLMService):
@@ -297,21 +254,7 @@ class LiveSession:
                     ),
                 ),
                 input_adapter,
-                ObservedOpenAITTSService(
-                    self.session,
-                    api_key=settings.openai_api_key,
-                    stop_frame_timeout_s=TTS_CONTEXT_IDLE_SECS,
-                    settings=OpenAITTSService.Settings(
-                        model=settings.tts_model,
-                        voice=settings.tts_voice,
-                        speed=settings.tts_speed,
-                        instructions=(
-                            load_prompt("tts_style")
-                            if settings.tts_model == "gpt-4o-mini-tts"
-                            else None
-                        ),
-                    ),
-                ),
+                build_tts_service(settings, self.session),
                 audio_observer,
                 transport.output(),
                 delivery,
@@ -326,9 +269,7 @@ class LiveSession:
         async def pipeline_error(_worker: PipelineWorker, frame: Any) -> None:
             category = frame.category.value if frame.category is not None else None
             processor = (
-                "OpenAITTSService"
-                if isinstance(frame.processor, OpenAITTSService)
-                else type(frame.processor).__name__
+                type(frame.processor).__name__.removeprefix("Observed")
                 if frame.processor is not None
                 else None
             )

@@ -84,6 +84,7 @@ async def test_audio_observer_correlates_tts_frames_with_utterance_id(tmp_path):
     observer.push_frame = forward
     await session.start()
     utterance_id = session.controller.pending.id
+    session.tts_context_assigned(utterance_id, "tts-context")
     for frame in (
         UtteranceMarkerFrame(utterance_id=utterance_id),
         TTSStartedFrame(context_id="tts-context"),
@@ -125,6 +126,7 @@ async def test_audio_from_cancelled_tts_context_is_not_forwarded(tmp_path):
     observer.push_frame = forward
     await session.start()
     first = session.controller.pending
+    session.tts_context_assigned(first.id, "old")
     await observer.process_frame(UtteranceMarkerFrame(first.id), FrameDirection.DOWNSTREAM)
     await observer.process_frame(TTSStartedFrame(context_id="old"), FrameDirection.DOWNSTREAM)
     await session.user_started()

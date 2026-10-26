@@ -1299,9 +1299,20 @@ class InterviewSession:
                         )
                     )
 
+    def tts_context_assigned(self, utterance_id: int, context_id: str) -> None:
+        pending = self.controller.pending
+        if not self._closed and pending is not None and pending.id == utterance_id:
+            self._tts_context_history[context_id] = utterance_id
+
+    def tts_context_utterance(self, context_id: str | None) -> int | None:
+        return self._tts_context_history.get(context_id or "")
+
     def tts_started(self, utterance_id: int, context_id: str | None) -> None:
         pending = self.controller.pending
         if pending is None or pending.id != utterance_id or context_id is None:
+            return
+        assigned = self._tts_context_history.get(context_id)
+        if assigned is not None and assigned != utterance_id:
             return
         self._tts_contexts[context_id] = utterance_id
         self._tts_context_history[context_id] = utterance_id
@@ -1407,7 +1418,11 @@ class InterviewSession:
             return
         if match:
             code = "tts_context_no_audio"
-        elif processor == "OpenAITTSService" and error and "Error getting audio" in error:
+        elif (
+            processor in {"OpenAITTSService", "CartesiaTTSService"}
+            and error
+            and ("Error getting audio" in error or error.startswith("Error:"))
+        ):
             code = "tts_provider_response"
         else:
             code = "pipeline_error"
