@@ -51,11 +51,12 @@ DECISION_SCHEMA = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["follow_up", "nudge", "clarification", "wait", "advance"],
+            "enum": ["follow_up", "nudge", "clarification", "wait", "advance", "detour"],
         },
         "text": {"type": "string"},
+        "project_fragment": {"type": "string"},
     },
-    "required": ["action", "text"],
+    "required": ["action", "text", "project_fragment"],
     "additionalProperties": False,
 }
 FEEDBACK_SCHEMA = {

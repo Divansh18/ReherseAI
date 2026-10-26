@@ -60,7 +60,7 @@ async def turn(adapter, *segments):
     await adapter.process_frame(UserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
 
 
-def harness(tmp_path, infer=None):
+def harness(tmp_path, infer=None, *, collect_name=False):
     adapter = InterviewInput()
     adapter.push_frame = lambda *_args, **_kwargs: asyncio.sleep(0)
     spoken = []
@@ -75,6 +75,9 @@ def harness(tmp_path, infer=None):
 
     log = SessionLog(tmp_path, "opening")
     session = InterviewSession(log, infer or default_infer, speak, lambda _: None)
+    if not collect_name:
+        # Legacy readiness tests exercise the path where name sharing was skipped.
+        session.controller.decline_name()
     adapter.session = session
     return session, adapter, spoken, log
 

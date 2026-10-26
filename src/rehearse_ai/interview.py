@@ -9,7 +9,8 @@ QUESTIONS = (
     "How did you know it was working well?",
     "What would you do differently now?",
 )
-GREETING = "Hey, how's it going?"
+GREETING = "Hey, I'm RehearseAI, your AI interview coach. How's your day going?"
+NAME_PROMPT = "What should I call you?"
 READINESS_PROMPT = "Ready to jump in?"
 READINESS_WAIT = "Just let me know when you're ready."
 READINESS_CLARIFICATION = (
@@ -27,6 +28,8 @@ class Stage(Enum):
     DELIVERING = auto()
     AWAITING_GREETING = auto()
     AWAITING_OPENING_ACK = auto()
+    AWAITING_NAME = auto()
+    AWAITING_DETOUR_RETURN = auto()
     AWAITING_QUESTION_START = auto()
     AWAITING_READINESS = auto()
     AWAITING_ANSWER = auto()
@@ -42,6 +45,7 @@ class ReplyKind(Enum):
     NUDGE = auto()
     CLARIFICATION = auto()
     ADVANCE = auto()
+    DETOUR = auto()
 
 
 class Readiness(Enum):
@@ -52,6 +56,10 @@ class Readiness(Enum):
 
 class UtteranceKind(Enum):
     GREETING = auto()
+    NAME_PROMPT = auto()
+    NAME_ACK = auto()
+    DETOUR_ACK = auto()
+    DETOUR_RESUME = auto()
     OPENING_ACK = auto()
     READINESS = auto()
     OPENING_WAIT = auto()
@@ -99,6 +107,12 @@ class InterviewController:
         self._follow_ups = [0] * len(QUESTIONS)
         self._clarifications = [0] * len(QUESTIONS)
         self._greeting_response = ""
+        self._preferred_name: str | None = None
+        self._name_declined = False
+        self._name_detour = False
+        self._name_repeats = 0
+        self._detour_resume_prompt: Utterance | None = None
+        self._detours = [0] * len(QUESTIONS)
         self._opening_repeats = {Stage.AWAITING_GREETING: 0, Stage.AWAITING_READINESS: 0}
         self._readiness_nudges = 0
         self._readiness_clarifications = 0
@@ -136,6 +150,27 @@ class InterviewController:
         return self._greeting_response
 
     @property
+    def preferred_name(self) -> str | None:
+        return self._preferred_name
+
+    @property
+    def name_declined(self) -> bool:
+        return self._name_declined
+
+    @property
+    def remaining_detours(self) -> int:
+        return 2 - self._detours[self._question_index] if self._question_index >= 0 else 2
+
+    def remember_name(self, name: str) -> None:
+        if not name or len(name) > 40 or not all(part.isalpha() for part in name.split()):
+            raise ValueError("Preferred name must be short plain text")
+        self._preferred_name = name
+        self._name_declined = False
+
+    def decline_name(self) -> None:
+        self._name_declined = True
+
+    @property
     def remaining_follow_ups(self) -> int:
         if self._question_index < 0:
             return MAX_FOLLOW_UPS_PER_QUESTION
@@ -166,7 +201,11 @@ class InterviewController:
             self._greeting_response = f"{self._greeting_response} {continuation}"
 
     def prepare_readiness(
-        self, acknowledgement: str, greeting_readiness: Readiness = Readiness.UNCLEAR
+        self,
+        acknowledgement: str,
+        greeting_readiness: Readiness = Readiness.UNCLEAR,
+        *,
+        ask_name: bool = False,
     ) -> Utterance:
         self._require(Stage.AWAITING_OPENING_ACK)
         acknowledgement = acknowledgement.strip()
@@ -184,12 +223,114 @@ class InterviewController:
             acknowledgement += "."
         if greeting_readiness is Readiness.READY:
             return self._prepare(UtteranceKind.OPENING_ACK, acknowledgement, None)
+        if ask_name and not self._preferred_name and not self._name_declined:
+            return self._prepare(
+                UtteranceKind.NAME_PROMPT, f"{acknowledgement} {NAME_PROMPT}", None
+            )
         if greeting_readiness is Readiness.DEFERRED:
             self._readiness_nudges = 1
             return self._prepare(
                 UtteranceKind.OPENING_WAIT, f"{acknowledgement} {READINESS_WAIT}", None
             )
         return self._prepare(UtteranceKind.READINESS, f"{acknowledgement} {READINESS_PROMPT}", None)
+
+    def submit_name(self, name: str | None, readiness: Readiness) -> Utterance:
+        self._require(Stage.AWAITING_NAME)
+        if name:
+            self.remember_name(name)
+            acknowledgement = f"Nice to meet you, {name}."
+        else:
+            self._name_declined = True
+            acknowledgement = "No problem."
+        if self._name_detour:
+            return self._prepare(UtteranceKind.DETOUR_ACK, acknowledgement, self._question_index)
+        if readiness is Readiness.READY:
+            return self._prepare(UtteranceKind.NAME_ACK, acknowledgement, None)
+        if readiness is Readiness.DEFERRED:
+            self._readiness_nudges = 1
+            return self._prepare(
+                UtteranceKind.OPENING_WAIT, f"{acknowledgement} {READINESS_WAIT}", None
+            )
+        return self._prepare(UtteranceKind.READINESS, f"{acknowledgement} {READINESS_PROMPT}", None)
+
+    def retry_name_prompt(self) -> Utterance:
+        self._require(Stage.AWAITING_NAME)
+        self._name_repeats += 1
+        if self._name_repeats > 1:
+            return self.submit_name(None, Readiness.UNCLEAR)
+        return self._prepare(
+            UtteranceKind.NAME_PROMPT,
+            NAME_PROMPT,
+            self._question_index if self._name_detour else None,
+        )
+
+    def skip_name_for_start(self) -> Utterance:
+        self._require(Stage.AWAITING_NAME)
+        self._name_declined = True
+        kind = UtteranceKind.DETOUR_ACK if self._name_detour else UtteranceKind.NAME_ACK
+        return self._prepare(
+            kind, "Okay, let's begin.", self._question_index if self._name_detour else None
+        )
+
+    def start_name_detour(self, resume_prompt: Utterance | None = None) -> Utterance:
+        if self._stage not in {Stage.AWAITING_ANSWER, Stage.AWAITING_PROPOSAL}:
+            raise InvalidTransition(f"Cannot start a detour from {self._stage.name}")
+        index = self._question_index
+        self._detours[index] = min(self._detours[index] + 1, 2)
+        self._name_detour = True
+        self._detour_resume_prompt = resume_prompt
+        if self._preferred_name:
+            return self._prepare(
+                UtteranceKind.DETOUR_ACK,
+                f"You can call me RehearseAI, and I have you as {self._preferred_name}.",
+                index,
+            )
+        if self._name_declined:
+            return self._prepare(
+                UtteranceKind.DETOUR_ACK, "No need to share a name. We can carry on.", index
+            )
+        return self._prepare(
+            UtteranceKind.NAME_PROMPT,
+            "You're right, I didn't ask. What should I call you?",
+            index,
+        )
+
+    def start_general_detour(self, text: str, resume_prompt: Utterance | None = None) -> Utterance:
+        self._require(Stage.AWAITING_PROPOSAL)
+        exhausted = self._detours[self._question_index] >= 2
+        self._detours[self._question_index] = min(self._detours[self._question_index] + 1, 2)
+        self._detour_resume_prompt = resume_prompt
+        if exhausted:
+            text = "Let's return to the project question when you're ready."
+        return self._prepare(UtteranceKind.DETOUR_ACK, text, self._question_index)
+
+    def restore_answers(self, answers: tuple[str, ...]) -> None:
+        self._require(Stage.AWAITING_PROPOSAL)
+        self._answers[self._question_index] = list(answers)
+
+    def add_detour_fragment(self, text: str) -> None:
+        self._require(Stage.AWAITING_PROPOSAL)
+        if fragment := text.strip():
+            self._answers[self._question_index].append(fragment)
+
+    def resume_detour(self) -> Utterance | None:
+        self._require(Stage.AWAITING_DETOUR_RETURN)
+        self._name_detour = False
+        prompt = self._detour_resume_prompt
+        self._detour_resume_prompt = None
+        if prompt and prompt.kind in {
+            UtteranceKind.FOLLOW_UP,
+            UtteranceKind.NUDGE,
+            UtteranceKind.CLARIFICATION,
+            UtteranceKind.REPEAT,
+        }:
+            return self._prepare(UtteranceKind.DETOUR_RESUME, prompt.text, self._question_index)
+        if self._answers[self._question_index]:
+            self._stage = Stage.AWAITING_PROPOSAL
+            return None
+        return self._prepare(
+            UtteranceKind.DETOUR_RESUME, QUESTIONS[self._question_index], self._question_index
+        )
 
     def begin_question_one(self) -> Utterance:
         self._require(Stage.AWAITING_QUESTION_START)
@@ -364,8 +505,12 @@ class InterviewController:
         self._pending = None
         if utterance.kind is UtteranceKind.GREETING:
             self._stage = Stage.AWAITING_GREETING
-        elif utterance.kind is UtteranceKind.OPENING_ACK:
+        elif utterance.kind in {UtteranceKind.OPENING_ACK, UtteranceKind.NAME_ACK}:
             self._stage = Stage.AWAITING_QUESTION_START
+        elif utterance.kind is UtteranceKind.NAME_PROMPT:
+            self._stage = Stage.AWAITING_NAME
+        elif utterance.kind is UtteranceKind.DETOUR_ACK:
+            self._stage = Stage.AWAITING_DETOUR_RETURN
         elif utterance.kind in {
             UtteranceKind.READINESS,
             UtteranceKind.OPENING_WAIT,
@@ -421,6 +566,12 @@ class InterviewController:
             self._stage = Stage.AWAITING_OPENING_ACK
         elif interrupted.kind is UtteranceKind.OPENING_ACK:
             self._stage = Stage.AWAITING_QUESTION_START
+        elif interrupted.kind is UtteranceKind.NAME_PROMPT:
+            self._stage = Stage.AWAITING_NAME
+        elif interrupted.kind is UtteranceKind.NAME_ACK:
+            self._stage = Stage.AWAITING_QUESTION_START
+        elif interrupted.kind is UtteranceKind.DETOUR_ACK:
+            self._stage = Stage.AWAITING_DETOUR_RETURN
         elif interrupted.kind in {
             UtteranceKind.READINESS,
             UtteranceKind.OPENING_WAIT,

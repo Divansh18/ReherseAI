@@ -68,6 +68,81 @@ _BARE_AFFIRM_READINESS = re.compile(
     r"|start|begin|let us go|let us do it)(?: now| please)?"
 )
 _FINAL_START = re.compile(r"\b(?:start|begin)(?: now| please)?$")
+_NAME_INTRO = re.compile(
+    r"\b(i(?:'m| am)|my name is|call me)\s+([A-Za-z]+)(?:\s+([A-Za-z]+))?", re.I
+)
+_NAME_DECLINE = re.compile(
+    r"\b(?:rather not|prefer not|do not want to|don't want to|no need to)\b.*\bname\b",
+    re.I,
+)
+_NAME_DETOUR = re.compile(
+    r"\bask\w*\b.{0,35}\bmy name\b"
+    r"|\bwhat\b.{0,20}\bcall me\b",
+    re.I,
+)
+_NAME_KNOWLEDGE = re.compile(r"\b(?:know|forget\w*|remember\w*)\b.{0,35}\bmy name\b", re.I)
+_NON_NAMES = {
+    "a",
+    "an",
+    "bit",
+    "doing",
+    "fine",
+    "good",
+    "great",
+    "happy",
+    "here",
+    "okay",
+    "ok",
+    "ready",
+    "really",
+    "tired",
+    "well",
+    "nervous",
+    "no",
+    "nah",
+    "not",
+    "so",
+    "very",
+    "yes",
+    "yeah",
+    "yep",
+    "start",
+    "begin",
+    "sure",
+}
+
+
+def _preferred_name(text: str, *, prompted: bool) -> str | None:
+    """Accept explicit self-identification, or a short answer to a name question."""
+    normalized = text.replace("’", "'").strip()
+    match = _NAME_INTRO.search(normalized)
+    if match:
+        prefix, first, second = match.groups()
+        explicit_name = prefix.lower() in {"my name is", "call me"}
+        if first.lower() not in _NON_NAMES and (explicit_name or first[0].isupper()):
+            parts = [first]
+            if second and second.lower() not in _NON_NAMES and second[0].isupper():
+                parts.append(second)
+            return " ".join(parts)
+    if prompted:
+        candidate = normalized.strip(" .!?")
+        if (
+            1 <= len(candidate.split()) <= 2
+            and all(part.isalpha() for part in candidate.split())
+            and all(
+                part[0].isupper() and part.lower() not in _NON_NAMES for part in candidate.split()
+            )
+        ):
+            return candidate
+    return None
+
+
+def _asks_about_name(text: str) -> bool:
+    addressed_to_coach = re.search(r"\b(?:you|your)\b", text, re.I)
+    return bool(
+        addressed_to_coach
+        and (_NAME_DETOUR.search(text) or ("?" in text and _NAME_KNOWLEDGE.search(text)))
+    )
 
 
 def _classify_readiness(text: str) -> Readiness:
@@ -101,7 +176,7 @@ def _classify_greeting_readiness(text: str) -> Readiness:
 
 
 def _fallback_opening_ack(text: str) -> str:
-    if re.search(r"\bhow (?:are|r) you\b|\bhow's it going\b", text, re.I):
+    if re.search(r"\bhow (?:are|r|about) you\b|\bhow's it going\b", text, re.I):
         return "Doing well, thanks."
     return "Thanks for telling me."
 
@@ -158,6 +233,8 @@ class InterviewSession:
         self._build_id = build_id
         self._stop_latched = False
         self._closed = False
+        self._answer_snapshot: tuple[str, ...] | None = None
+        self._latest_candidate_turn = ""
 
     @property
     def response_task(self) -> asyncio.Task[None] | None:
@@ -359,6 +436,38 @@ class InterviewSession:
         if await self._route_opening(answer):
             return
 
+        interrupted = self.controller.interrupted_utterance
+        if interrupted is not None and interrupted.kind is UtteranceKind.DETOUR_ACK:
+            if self._interrupted_output_id != interrupted.id:
+                await self._queue_speech(self.controller.retry_interrupted())
+                return
+            self.controller.accept_barge_in_answer(answer)
+            self._interrupted_output_id = None
+            if self.controller.stage is Stage.AWAITING_DETOUR_RETURN:
+                utterance = self.controller.resume_detour()
+                if utterance:
+                    await self._queue_speech(utterance)
+                else:
+                    self._start_response()
+            return
+
+        if (
+            answer
+            and _asks_about_name(answer)
+            and self.controller.stage in {Stage.AWAITING_ANSWER, Stage.AWAITING_PROPOSAL}
+        ):
+            self._record("candidate_detour", speaker="candidate", kind="name", text=answer)
+            await self._queue_speech(self.controller.start_name_detour(self._last_delivered_prompt))
+            return
+
+        if self.controller.stage is Stage.AWAITING_DETOUR_RETURN:
+            utterance = self.controller.resume_detour()
+            if utterance:
+                await self._queue_speech(utterance)
+            else:
+                self._start_response()
+            return
+
         if _SKIP.fullmatch(answer) and self.controller.interrupted_utterance is not None:
             try:
                 utterance = self.controller.skip_interrupted()
@@ -408,6 +517,10 @@ class InterviewSession:
                 elif _REPEAT.fullmatch(answer):
                     utterance = self.controller.request_repeat()
                 else:
+                    self._answer_snapshot = self.controller.answers[
+                        self.controller.current_question_number - 1
+                    ]
+                    self._latest_candidate_turn = answer
                     utterance = self.controller.submit_answer(answer)
             except LimitReached:
                 self._record("clarification_limit", speaker=None)
@@ -421,6 +534,10 @@ class InterviewSession:
         elif self.controller.stage is Stage.AWAITING_PROPOSAL:
             if not answer:
                 return
+            self._answer_snapshot = self.controller.answers[
+                self.controller.current_question_number - 1
+            ]
+            self._latest_candidate_turn = answer
             self.controller.add_answer_continuation(answer)
         elif self.controller.stage is Stage.AWAITING_FEEDBACK:
             if not answer:
@@ -436,6 +553,8 @@ class InterviewSession:
         opening_kinds = {
             UtteranceKind.GREETING,
             UtteranceKind.OPENING_ACK,
+            UtteranceKind.NAME_PROMPT,
+            UtteranceKind.NAME_ACK,
             UtteranceKind.READINESS,
             UtteranceKind.OPENING_WAIT,
             UtteranceKind.OPENING_CLARIFICATION,
@@ -482,6 +601,26 @@ class InterviewSession:
 
         if self.controller.stage is Stage.AWAITING_QUESTION_START:
             await self._queue_speech(self.controller.begin_question_one())
+            return True
+
+        if self.controller.stage is Stage.AWAITING_NAME:
+            if not answer or _REPEAT.fullmatch(answer):
+                await self._queue_speech(self.controller.retry_name_prompt())
+                return True
+            readiness = _classify_greeting_readiness(answer)
+            name = None if _NAME_DECLINE.search(answer) else _preferred_name(answer, prompted=True)
+            self._record(
+                "name_response",
+                speaker="candidate",
+                preferred_name=name,
+                declined=bool(_NAME_DECLINE.search(answer)),
+                readiness=readiness.name.lower(),
+            )
+            if readiness is Readiness.READY and name is None:
+                utterance = self.controller.skip_name_for_start()
+            else:
+                utterance = self.controller.submit_name(name, readiness)
+            await self._queue_speech(utterance)
             return True
 
         if self.controller.stage is Stage.AWAITING_OPENING_ACK:
@@ -583,6 +722,7 @@ class InterviewSession:
             "current_question_number": self.controller.current_question_number,
             "current_question": self.controller.current_question,
             "greeting_response": self.controller.greeting_response,
+            "preferred_name": self.controller.preferred_name,
             "answers_by_question": [list(turns) for turns in self.controller.answers],
             "current_question_answers": current_answers,
             "current_question_answer": " ".join(current_answers),
@@ -601,11 +741,20 @@ class InterviewSession:
             "max_extra_prompts_per_question": {"follow_up_or_nudge": 1, "clarification": 1},
             "remaining_follow_ups": self.controller.remaining_follow_ups,
             "remaining_clarifications": self.controller.remaining_clarifications,
+            "remaining_detours": self.controller.remaining_detours,
+            "latest_candidate_turn": self._latest_candidate_turn,
         }
 
     async def _respond(self, generation: int) -> None:
         try:
             if not self._stop_latched and self.controller.stage is Stage.AWAITING_OPENING_ACK:
+                if name := _preferred_name(self.controller.greeting_response, prompted=False):
+                    self.controller.remember_name(name)
+                    self._record(
+                        "preferred_name_received", speaker="candidate", preferred_name=name
+                    )
+                elif _NAME_DECLINE.search(self.controller.greeting_response):
+                    self.controller.decline_name()
                 greeting_readiness = _classify_greeting_readiness(self.controller.greeting_response)
                 self._record(
                     "greeting_readiness_classified",
@@ -627,12 +776,18 @@ class InterviewSession:
                     raise ValueError("Opening response did not contain text")
                 try:
                     utterance = self.controller.prepare_readiness(
-                        acknowledgement, greeting_readiness
+                        acknowledgement,
+                        greeting_readiness,
+                        ask_name=not self.controller.preferred_name
+                        and not self.controller.name_declined,
                     )
                 except ValueError:
                     self._record("opening_ack_fallback", speaker=None, error_type="InvalidText")
                     utterance = self.controller.prepare_readiness(
-                        _fallback_opening_ack(self.controller.greeting_response), greeting_readiness
+                        _fallback_opening_ack(self.controller.greeting_response),
+                        greeting_readiness,
+                        ask_name=not self.controller.preferred_name
+                        and not self.controller.name_declined,
                     )
                 self._record(
                     "inference_completed",
@@ -681,6 +836,34 @@ class InterviewSession:
                 if action == "WAIT":
                     self._record(
                         "awaiting_continuation", speaker=None, answer_number=self._answer_number
+                    )
+                    return
+                if action == "DETOUR":
+                    if (
+                        not isinstance(text, str)
+                        or not text.strip()
+                        or len(text) > 180
+                        or text.count("?") > 1
+                    ):
+                        raise ValueError("Invalid detour response")
+                    if self._answer_snapshot is not None:
+                        self.controller.restore_answers(self._answer_snapshot)
+                    fragment = result.get("project_fragment", "")
+                    if isinstance(fragment, str) and fragment.strip():
+                        if fragment.lower() in self._latest_candidate_turn.lower():
+                            self.controller.add_detour_fragment(fragment)
+                        else:
+                            self._record(
+                                "proposal_rejected",
+                                speaker=None,
+                                reason="nonliteral_project_fragment",
+                                action="detour_fragment",
+                            )
+                    self._record("candidate_detour", speaker="candidate", kind="general")
+                    await self._queue_speech(
+                        self.controller.start_general_detour(
+                            text.strip(), self._last_delivered_prompt
+                        )
                     )
                     return
                 try:
@@ -771,7 +954,10 @@ class InterviewSession:
                 greeting_readiness = _classify_greeting_readiness(self.controller.greeting_response)
                 await self._queue_speech(
                     self.controller.prepare_readiness(
-                        _fallback_opening_ack(self.controller.greeting_response), greeting_readiness
+                        _fallback_opening_ack(self.controller.greeting_response),
+                        greeting_readiness,
+                        ask_name=not self.controller.preferred_name
+                        and not self.controller.name_declined,
                     )
                 )
             else:
@@ -890,6 +1076,12 @@ class InterviewSession:
             elif self.controller.stage is Stage.AWAITING_QUESTION_START:
                 next_question = self.controller.begin_question_one()
                 asyncio.create_task(self._queue_speech(next_question))
+            elif self.controller.stage is Stage.AWAITING_DETOUR_RETURN:
+                next_utterance = self.controller.resume_detour()
+                if next_utterance is None:
+                    self._start_response()
+                else:
+                    asyncio.create_task(self._queue_speech(next_utterance))
 
     async def close(self) -> None:
         if self._closed:
