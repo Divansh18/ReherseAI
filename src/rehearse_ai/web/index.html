@@ -3,52 +3,61 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#101827">
-    <title>RehearseAI — Voice interview practice</title>
+    <meta name="theme-color" content="#ffffff">
+    <title>RehearseAI — Interview practice</title>
     <link rel="stylesheet" href="/assets/styles.css">
   </head>
   <body>
     <main class="shell">
-      <header class="masthead">
-        <div class="brand"><span class="mark" aria-hidden="true">R</span><span>Rehearse<span class="accent">AI</span></span></div>
-        <span class="eyebrow">Private local practice</span>
+      <header class="site-header">
+        <div class="identity">
+          <h1>RehearseAI</h1>
+          <p>A little practice before it matters.</p>
+        </div>
+        <div class="session-status" aria-label="Session status">
+          <span id="status-dot" class="status-dot" aria-hidden="true"></span>
+          <span id="connection" role="status" aria-live="polite">Ready</span>
+          <span class="status-separator" aria-hidden="true">·</span>
+          <span id="microphone">Microphone off</span>
+        </div>
       </header>
 
-      <section class="hero" aria-labelledby="title">
-        <div class="hero-copy">
-          <p class="kicker">MOCK INTERVIEW · VOICE SESSION</p>
-          <h1 id="title">Find the story behind your work.</h1>
-          <p class="intro">Four project questions, then short feedback. Talk through a project you’re proud of.</p>
+      <div class="content-grid">
+        <section class="card interview-card" aria-labelledby="interview-heading">
+          <div class="card-heading">
+            <h2 id="interview-heading">Interview</h2>
+            <span id="question-count" class="progress" hidden>01 / 04</span>
+          </div>
+          <div class="interview-content">
+            <p id="phase-label" class="phase-label">Before you begin</p>
+            <p id="question" class="question" aria-live="polite">Four questions about your project, followed by short feedback.</p>
+          </div>
+          <p id="guidance" class="guidance">Take a moment to find a project you’d like to talk about.</p>
           <div class="controls">
-            <button id="start" class="primary" type="button">Start interview <span aria-hidden="true">↗</span></button>
+            <button id="start" class="primary" type="button">Start interview</button>
             <button id="end" class="secondary" type="button" disabled>End session</button>
           </div>
-          <p class="hint">The coach's voice is AI-generated. Allow microphone access when your browser asks. Headphones help avoid echo.</p>
-        </div>
-        <div class="session-card" aria-label="Session status">
-          <div class="card-top"><span class="card-label">SESSION STATUS</span><span id="status-dot" class="status-dot" aria-hidden="true"></span></div>
-          <p id="connection" class="status-title" role="status" aria-live="polite">Ready when you are</p>
-          <p id="microphone" class="status-detail">Microphone off</p>
-          <div class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
-          <p id="session-id" class="session-id"></p>
-          <p id="build-id" class="session-id">Build __BUILD_ID__</p>
-        </div>
-      </section>
-
-      <section class="content-grid">
-        <section class="question-panel" aria-labelledby="question-heading">
-          <div class="section-head"><h2 id="question-heading">Current question</h2><span id="question-count">01 / 04</span></div>
-          <p id="question" class="question" aria-live="polite">Your first question will appear here.</p>
-          <p class="panel-foot">You can pause briefly or speak while the coach is talking.</p>
+          <p class="disclosure">The coach’s voice is AI-generated. Allow microphone access when prompted.</p>
         </section>
-        <section class="transcript-panel" aria-labelledby="transcript-heading">
-          <div class="section-head"><h2 id="transcript-heading">Conversation</h2><span>LIVE TRANSCRIPT</span></div>
+
+        <section class="card conversation-card" aria-labelledby="transcript-heading">
+          <div class="card-heading">
+            <h2 id="transcript-heading">Conversation</h2>
+            <span class="card-caption">Live transcript</span>
+          </div>
           <ol id="transcript" class="transcript" aria-live="polite" aria-relevant="additions text">
-            <li class="empty">Your conversation will appear here as it happens.</li>
+            <li class="empty">Your conversation will appear here when you begin.</li>
           </ol>
         </section>
-      </section>
+      </div>
+
       <p id="error" class="error" role="alert" hidden></p>
+      <details class="diagnostics">
+        <summary>Diagnostics</summary>
+        <p id="session-id">No session yet</p>
+        <p id="build-id">Build __BUILD_ID__</p>
+        <p>Agent text appears when server output starts. Browser playback is not confirmed.</p>
+      </details>
       <audio id="remote-audio" autoplay></audio>
     </main>
     <script src="/assets/app.js" defer></script>

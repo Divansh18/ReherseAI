@@ -73,7 +73,7 @@ def test_local_browser_assets_and_health_load_without_provider_calls(tmp_path):
         page = client.get("/")
         assert page.status_code == 200
         assert "Start interview" in page.text
-        assert "Four project questions, then short feedback." in page.text
+        assert "Four questions about your project, followed by short feedback." in page.text
         assert "voice is AI-generated" in page.text
         assert f"Build {health['build_id']}" in page.text
         assert page.headers["cache-control"] == "no-store"

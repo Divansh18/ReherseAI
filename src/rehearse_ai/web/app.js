@@ -3,8 +3,10 @@ const endButton = document.querySelector('#end');
 const connectionLabel = document.querySelector('#connection');
 const microphoneLabel = document.querySelector('#microphone');
 const statusDot = document.querySelector('#status-dot');
+const phaseLabel = document.querySelector('#phase-label');
 const questionLabel = document.querySelector('#question');
 const questionCount = document.querySelector('#question-count');
+const guidance = document.querySelector('#guidance');
 const transcript = document.querySelector('#transcript');
 const errorLabel = document.querySelector('#error');
 const audio = document.querySelector('#remote-audio');
@@ -17,28 +19,35 @@ const answers = new Map();
 let attempt = 0;
 let offerAbort = null;
 
-function status(message, mic = 'Microphone off', active = false) {
-  connectionLabel.textContent = message;
-  microphoneLabel.textContent = mic;
-  statusDot.classList.toggle('active', active);
+function microphoneState() {
+  return microphone?.getAudioTracks().some((track) => track.readyState === 'live')
+    ? 'Microphone on' : 'Microphone off';
 }
 
-function showError(message, microphoneActive = false) {
+function setStatus(label) {
+  connectionLabel.textContent = label;
+  microphoneLabel.textContent = microphoneState();
+  statusDot.dataset.state = label.toLowerCase();
+}
+
+function setInterviewPhase(phase, text, hint = '') {
+  phaseLabel.textContent = phase;
+  questionLabel.textContent = text;
+  guidance.textContent = hint;
+}
+
+function showError(message) {
   errorLabel.textContent = message;
   errorLabel.hidden = false;
   errorLabel.dataset.kind = 'error';
-  status(
-    microphoneActive ? 'Response needs attention' : 'Connection needs attention',
-    microphoneActive ? 'Microphone on' : 'Microphone off',
-    microphoneActive,
-  );
+  setStatus('Error');
 }
 
 function showWarning(message) {
   errorLabel.textContent = message;
   errorLabel.hidden = false;
   errorLabel.dataset.kind = 'warning';
-  status('Waiting for audio…', 'Microphone on', true);
+  setStatus('Error');
 }
 
 function clearWarning() {
@@ -48,101 +57,118 @@ function clearWarning() {
   }
 }
 
+function nearTranscriptBottom() {
+  return transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 72;
+}
+
+function scrollIfNear(nearBottom) {
+  if (nearBottom) transcript.scrollTop = transcript.scrollHeight;
+}
+
 function addTurn(speaker, text, id = null) {
+  const nearBottom = nearTranscriptBottom();
   transcript.querySelector('.empty')?.remove();
   const item = document.createElement('li');
   item.className = speaker === 'candidate' ? 'candidate' : 'agent';
   const label = document.createElement('span');
   label.className = 'speaker';
-  label.textContent = speaker === 'candidate' ? 'You' : 'Coach';
+  label.textContent = speaker === 'candidate' ? 'You' : 'RehearseAI';
   item.append(label, document.createTextNode(text));
   transcript.append(item);
-  transcript.scrollTop = transcript.scrollHeight;
-  if (id !== null) {
-    item.classList.add('prepared');
-    utterances.set(id, item);
-  }
+  scrollIfNear(nearBottom);
+  if (id !== null) utterances.set(id, item);
   return item;
+}
+
+function markInterrupted(item) {
+  if (!item || item.querySelector('.annotation')) return;
+  const annotation = document.createElement('span');
+  annotation.className = 'annotation';
+  annotation.textContent = 'Interrupted';
+  item.append(annotation);
 }
 
 function handleEvent(message) {
   if (message.type !== 'rehearseai') return;
   const entry = message.event;
   if (!entry || !entry.event) return;
+
   if (entry.event === 'session_started') {
     document.querySelector('#session-id').textContent = `Session ${entry.session_id}`;
+  } else if (entry.event === 'candidate_started') {
+    if (errorLabel.hidden) setStatus('Listening');
+  } else if (entry.event === 'candidate_turn_completed') {
+    if (errorLabel.hidden) setStatus('Thinking');
   } else if (entry.event === 'agent_prepared') {
-    clearWarning();
     prepared.set(entry.utterance_id, entry);
-    status(
-      entry.utterance_kind === 'question' && entry.question_number === 1
-        ? 'Preparing first question — wait for audio…'
-        : 'Preparing response…',
-      'Microphone on', true,
-    );
+    if (errorLabel.hidden) setStatus('Thinking');
   } else if (entry.event === 'agent_output_started') {
     clearWarning();
-    const item = prepared.get(entry.utterance_id);
-    if (!item) return;
-    addTurn('agent', item.text, entry.utterance_id);
-    utterances.get(entry.utterance_id).querySelector('.speaker').textContent = 'Coach · audio sent';
-    if (item.utterance_kind === 'question') {
-      questionLabel.textContent = item.text;
-      questionCount.textContent = `${String(item.question_number).padStart(2, '0')} / 04`;
+    const pending = prepared.get(entry.utterance_id);
+    if (!pending) return;
+    if (!utterances.has(entry.utterance_id)) {
+      addTurn('agent', pending.text, entry.utterance_id);
     }
-    status('Speaking…', 'Microphone on', true);
+    if (pending.utterance_kind === 'question') {
+      setInterviewPhase('Current question', pending.text, 'Take your time with your answer.');
+      questionCount.textContent = `${String(pending.question_number).padStart(2, '0')} / 04`;
+      questionCount.hidden = false;
+    }
+    setStatus('Speaking');
   } else if (entry.event === 'agent_interrupted') {
     prepared.delete(entry.utterance_id);
-    const item = utterances.get(entry.utterance_id);
-    item?.classList.remove('prepared');
-    item?.classList.add('interrupted');
-    status('Listening…', 'Microphone on', true);
+    markInterrupted(utterances.get(entry.utterance_id));
+    if (errorLabel.hidden) setStatus('Listening');
   } else if (entry.event === 'agent_delivery_reported') {
-    clearWarning();
-    utterances.get(entry.utterance_id)?.classList.remove('prepared');
-    const item = utterances.get(entry.utterance_id);
-    if (item) item.querySelector('.speaker').textContent = 'Coach · server output complete';
     prepared.delete(entry.utterance_id);
-    status('Listening…', 'Microphone on', true);
+    if (errorLabel.hidden) setStatus('Listening');
   } else if (entry.event === 'candidate_final' && entry.text) {
     const answerNumber = entry.answer_number ?? entry.sequence;
     const previous = answers.get(answerNumber);
     if (previous) {
+      const nearBottom = nearTranscriptBottom();
       previous.append(document.createTextNode(` ${entry.text}`));
+      scrollIfNear(nearBottom);
     } else {
       answers.set(answerNumber, addTurn('candidate', entry.text));
     }
-    transcript.scrollTop = transcript.scrollHeight;
   } else if (entry.event === 'awaiting_continuation') {
-    status('Keep going when you’re ready', 'Microphone on', true);
+    guidance.textContent = 'Take your time; keep going when you’re ready.';
+    if (errorLabel.hidden) setStatus('Listening');
   } else if (entry.event === 'interview_complete') {
-    status('Interview complete', 'Microphone still connected', true);
+    setInterviewPhase('Complete', 'Your feedback is in the conversation.', 'Select End session to release your microphone.');
+    questionCount.hidden = true;
+    setStatus('Ended');
   } else if (entry.event === 'interview_ended_early') {
-    status('Interview ended early', 'Microphone still connected', true);
+    setInterviewPhase('Ended', 'Interview ended early.', 'Select End session to release your microphone.');
+    questionCount.hidden = true;
+    setStatus('Ended');
   } else if (entry.event === 'clarification_limit') {
-    status('Please answer the current question', 'Microphone on', true);
+    guidance.textContent = 'Answer the current question, or say “end the interview” to stop.';
+    if (errorLabel.hidden) setStatus('Listening');
   } else if (entry.event === 'opening_repeat_limit') {
-    status(
-      entry.opening_phase === 'greeting'
-        ? 'Tell the coach how you are doing to continue'
-        : 'Say “start” when ready, or “end the interview” to stop',
-      'Microphone on', true,
-    );
+    guidance.textContent = entry.opening_phase === 'greeting'
+      ? 'Tell RehearseAI how you’re doing to continue.'
+      : 'Say “start” when ready, or “end the interview” to stop.';
+    if (errorLabel.hidden) setStatus('Listening');
   } else if (entry.event === 'opening_waiting_for_readiness') {
-    status('Say “start” when ready, or “end the interview” to stop', 'Microphone on', true);
+    guidance.textContent = 'Say “start” when ready, or “end the interview” to stop.';
+    if (errorLabel.hidden) setStatus('Listening');
   } else if (entry.event === 'no_project_waiting') {
-    status('Return with a technical example, or say “end the interview”', 'Microphone on', true);
+    guidance.textContent = 'Return with a technical example, or say “end the interview”.';
+    if (errorLabel.hidden) setStatus('Listening');
   } else if (entry.event === 'no_project_repeat_limit' || entry.event === 'project_example_required') {
-    status('Use a technical example, or say “end the interview”', 'Microphone on', true);
+    guidance.textContent = 'Use a technical example, or say “end the interview”.';
+    if (errorLabel.hidden) setStatus('Listening');
   } else if (entry.event === 'response_error') {
     if (entry.error_code === 'tts_context_no_audio') {
       showWarning('The voice service returned no audio. You can speak to retry the prompt.');
     } else if (entry.failure_stage === 'opening_inference' || entry.failure_stage === 'opening_intent') {
       showWarning('The coach is recovering from a planning error. You can keep speaking.');
     } else if (entry.failure_stage === 'pipeline' && ['OpenAITTSService', 'CartesiaTTSService'].includes(entry.processor)) {
-      showError('The voice provider could not generate audio. Try speaking again; end the session if it persists.', true);
+      showError('The voice provider could not generate audio. Try speaking again; end the session if it persists.');
     } else {
-      showError('The coach could not complete a response. Try speaking again or end the session.', true);
+      showError('The coach could not complete a response. Try speaking again or end the session.');
     }
   }
 }
@@ -157,16 +183,22 @@ function endSession() {
   peer = null;
   microphone?.getTracks().forEach((track) => track.stop());
   microphone = null;
+  audio.pause();
   audio.srcObject = null;
   startButton.disabled = false;
   endButton.disabled = true;
-  status('Session ended');
+  setInterviewPhase('Ended', 'Session ended.');
+  questionCount.hidden = true;
+  setStatus('Ended');
 }
 
 async function waitForIce(pc) {
   if (pc.iceGatheringState === 'complete') return;
   await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => { pc.removeEventListener('icegatheringstatechange', check); reject(new Error('WebRTC setup timed out.')); }, 12000);
+    const timeout = setTimeout(() => {
+      pc.removeEventListener('icegatheringstatechange', check);
+      reject(new Error('WebRTC setup timed out.'));
+    }, 12000);
     function check() {
       if (pc.iceGatheringState === 'complete') {
         clearTimeout(timeout);
@@ -181,38 +213,67 @@ async function waitForIce(pc) {
 async function startSession() {
   const thisAttempt = ++attempt;
   errorLabel.hidden = true;
-  transcript.innerHTML = '<li class="empty">Your conversation will appear here as it happens.</li>';
+  delete errorLabel.dataset.kind;
+  const empty = document.createElement('li');
+  empty.className = 'empty';
+  empty.textContent = 'Your conversation will appear here when you begin.';
+  transcript.replaceChildren(empty);
   utterances.clear();
   prepared.clear();
   answers.clear();
-  questionLabel.textContent = 'Your first question will appear here.';
-  questionCount.textContent = '01 / 04';
+  document.querySelector('#session-id').textContent = 'Connecting to a session';
+  setInterviewPhase('Opening', 'We’ll start with a quick hello.', 'Allow microphone access when prompted.');
+  questionCount.hidden = true;
   startButton.disabled = true;
   endButton.disabled = false;
-  status('Requesting microphone…');
+  setStatus('Connecting');
+
   try {
-    if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone access requires a supported browser on localhost.');
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
-    if (thisAttempt !== attempt) { stream.getTracks().forEach((track) => track.stop()); return; }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('Microphone access requires a supported browser on localhost.');
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true },
+    });
+    if (thisAttempt !== attempt) {
+      stream.getTracks().forEach((track) => track.stop());
+      return;
+    }
     microphone = stream;
-    status('Connecting…', 'Microphone on', true);
+    microphone.getAudioTracks().forEach((track) => {
+      track.addEventListener('ended', () => {
+        if (thisAttempt === attempt && microphone === stream) {
+          showError('Microphone access stopped. End the session, then allow access and restart.');
+        }
+      });
+    });
+    setStatus('Connecting');
     peer = new RTCPeerConnection();
     microphone.getAudioTracks().forEach((track) => peer.addTrack(track, microphone));
     channel = peer.createDataChannel('rehearseai');
     const activeChannel = channel;
     channel.onmessage = (event) => {
+      if (thisAttempt !== attempt) return;
       try { handleEvent(JSON.parse(event.data)); } catch { /* Ignore unrelated data. */ }
     };
     channel.onclose = () => {
-      if (channel === activeChannel && peer) showError('The session connection closed. End and restart the session.');
+      if (thisAttempt === attempt && channel === activeChannel && peer) {
+        showError('The session connection closed. End and restart the session.');
+      }
     };
     peer.ontrack = (event) => {
+      if (thisAttempt !== attempt) return;
       audio.srcObject = event.streams[0] || new MediaStream([event.track]);
       audio.play().catch(() => showError('Audio playback was blocked. Allow audio in your browser and retry.'));
     };
     peer.onconnectionstatechange = () => {
-      if (peer?.connectionState === 'connected') status('Interview in progress', 'Microphone on', true);
-      if (peer && ['failed', 'disconnected'].includes(peer.connectionState)) showError('Connection lost. End and restart the session.');
+      if (thisAttempt !== attempt || !peer) return;
+      if (peer.connectionState === 'connected' && connectionLabel.textContent === 'Connecting') {
+        setStatus('Listening');
+      }
+      if (['failed', 'disconnected'].includes(peer.connectionState)) {
+        showError('Connection lost. End and restart the session.');
+      }
     };
     await peer.setLocalDescription(await peer.createOffer());
     if (thisAttempt !== attempt) return;
@@ -233,7 +294,9 @@ async function startSession() {
   } catch (error) {
     if (thisAttempt !== attempt) return;
     endSession();
-    showError(error.name === 'NotAllowedError' ? 'Microphone permission was denied. Allow access in your browser and try again.' : error.message);
+    showError(error.name === 'NotAllowedError'
+      ? 'Microphone permission was denied. Allow access in your browser and try again.'
+      : error.message);
   }
 }
 
