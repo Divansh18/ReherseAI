@@ -134,6 +134,7 @@ class InterviewController:
         self._name_detour = False
         self._name_repeats = 0
         self._detour_resume_prompt: Utterance | None = None
+        self._return_after_detour = False
         self._detours = [0] * len(QUESTIONS)
         self._choice_repeats = 0
         self._no_project_choice_replies = 0
@@ -389,6 +390,7 @@ class InterviewController:
         exhausted = self._detours[self._question_index] >= 2
         self._detours[self._question_index] = min(self._detours[self._question_index] + 1, 2)
         self._detour_resume_prompt = resume_prompt
+        self._return_after_detour = kind is UtteranceKind.DETOUR_ACK
         if exhausted and kind is UtteranceKind.TOPIC_BOUNDARY:
             text = "I can only help with interview practice here. Continue or finish?"
         return self._prepare(kind, text, self._question_index)
@@ -407,6 +409,7 @@ class InterviewController:
             raise ValueError("Invalid conversational response kind")
         index = self._index_for(self._interrupted)
         self._detour_resume_prompt = self._interrupted
+        self._return_after_detour = kind is UtteranceKind.DETOUR_ACK
         self._interrupted = None
         if index is not None:
             self._detours[index] = min(self._detours[index] + 1, 2)
@@ -416,6 +419,7 @@ class InterviewController:
         self._require(Stage.AWAITING_CONTINUE_CHOICE)
         prompt = self._detour_resume_prompt
         self._detour_resume_prompt = None
+        self._return_after_detour = False
         self._choice_repeats = 0
         if prompt is not None:
             return self._prepare(UtteranceKind.DETOUR_RESUME, prompt.text, self._index_for(prompt))
@@ -427,7 +431,7 @@ class InterviewController:
         )
 
     def repeat_continuation_choice(
-        self, *, off_topic: bool = False, presence: bool = False
+        self, *, off_topic: bool = False, presence: bool = False, explain: bool = False
     ) -> Utterance | None:
         self._require(Stage.AWAITING_CONTINUE_CHOICE)
         if self._choice_repeats >= MAX_PENDING_CHOICE_REPLIES:
@@ -436,6 +440,8 @@ class InterviewController:
         text = (
             "I'm here. Would you like to continue the interview or finish?"
             if presence
+            else "Continue with the project question I asked, or finish here?"
+            if explain
             else "This session is for interview practice. Continue with your project or finish?"
             if off_topic
             else "Would you like to continue the interview or finish here?"
@@ -466,6 +472,7 @@ class InterviewController:
     def resume_detour(self) -> Utterance | None:
         self._require(Stage.AWAITING_DETOUR_RETURN)
         self._name_detour = False
+        self._return_after_detour = False
         prompt = self._detour_resume_prompt
         self._detour_resume_prompt = None
         if prompt and prompt.kind in {
@@ -473,6 +480,7 @@ class InterviewController:
             UtteranceKind.NUDGE,
             UtteranceKind.CLARIFICATION,
             UtteranceKind.REPEAT,
+            UtteranceKind.DETOUR_RESUME,
         }:
             return self._prepare(UtteranceKind.DETOUR_RESUME, prompt.text, self._question_index)
         if self._answers[self._question_index]:
@@ -481,6 +489,13 @@ class InterviewController:
         return self._prepare(
             UtteranceKind.DETOUR_RESUME, QUESTIONS[self._question_index], self._question_index
         )
+
+    def restate_project_prompt(self, prompt: Utterance) -> Utterance:
+        """Restate a pending question without treating a bare control reply as an answer."""
+        self._require(Stage.AWAITING_ANSWER)
+        if prompt.question_number != self.current_question_number:
+            raise InvalidTransition("Project prompt belongs to another question")
+        return self._prepare(UtteranceKind.DETOUR_RESUME, prompt.text, self._question_index)
 
     def begin_question_one(self) -> Utterance:
         self._require(Stage.AWAITING_QUESTION_START)
@@ -742,7 +757,7 @@ class InterviewController:
         }:
             self._stage = (
                 Stage.AWAITING_DETOUR_RETURN
-                if self._name_detour
+                if self._name_detour or self._return_after_detour
                 else Stage.AWAITING_CONTINUE_CHOICE
             )
         elif utterance.kind is UtteranceKind.NO_PROJECT_INVITE:
@@ -817,7 +832,7 @@ class InterviewController:
         }:
             self._stage = (
                 Stage.AWAITING_DETOUR_RETURN
-                if self._name_detour
+                if self._name_detour or self._return_after_detour
                 else Stage.AWAITING_CONTINUE_CHOICE
             )
         elif interrupted.kind is UtteranceKind.NO_PROJECT_INVITE:

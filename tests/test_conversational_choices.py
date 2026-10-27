@@ -115,7 +115,7 @@ async def test_feedback_request_waits_for_choice_without_replaying_follow_up(tmp
     await turn(adapter, "Continue with the project.")
     assert spoken[-1].kind is UtteranceKind.DETOUR_RESUME
     assert spoken[-1].text == "What part did you build yourself?"
-    assert [kind for kind, _ in calls].count("decision") == 3
+    assert [kind for kind, _ in calls].count("decision") == 2
     await session.close()
 
 
@@ -170,7 +170,7 @@ async def test_off_topic_barge_in_preserves_unheard_q3_and_waits_for_choice(tmp_
     assert spoken[-1].kind is UtteranceKind.DETOUR_RESUME
     assert spoken[-1].text == QUESTIONS[2]
     assert all(item.text != QUESTIONS[3] for item in spoken)
-    assert len([kind for kind, _ in calls if kind == "decision"]) == 5
+    assert len([kind for kind, _ in calls if kind == "decision"]) == 4
     deliver(session)
     assert session.controller.current_question_number == 3
     await turn(adapter, "I checked it against expected outputs.")
@@ -405,7 +405,7 @@ async def test_identity_misclassification_is_retried_once_for_feedback_request(t
 
 
 @pytest.mark.asyncio
-async def test_actual_coach_identity_question_waits_for_continuation_choice(tmp_path):
+async def test_actual_coach_identity_question_returns_to_pending_question(tmp_path):
     async def infer(kind, payload):
         if kind == "opening_ack":
             return {"text": "Thanks."}
@@ -421,10 +421,202 @@ async def test_actual_coach_identity_question_waits_for_continuation_choice(tmp_
     assert spoken[-1].kind is UtteranceKind.DETOUR_ACK
     assert spoken[-1].text.startswith("You can call me RehearseAI.")
     deliver(session)
-    assert session.controller.stage is Stage.AWAITING_CONTINUE_CHOICE
+    await asyncio.sleep(0)
+    assert session.controller.pending.kind is UtteranceKind.DETOUR_RESUME
+    assert session.controller.pending.text == QUESTIONS[0]
     assert session.controller.answers == ((), (), (), ())
     assert any(
         json.loads(line)["event"] == "decision_normalized"
         for line in log.path.read_text().splitlines()
     )
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_project_detour_and_two_continue_turns_never_close(tmp_path):
+    async def infer(kind, payload):
+        if kind == "opening_ack":
+            return {"text": "Thanks."}
+        turn_text = payload["latest_candidate_turn"]
+        if turn_text == "I'm proud of building job agents.":
+            return {
+                "action": "follow_up",
+                "text": "Can you describe what your job agents do and what your role was?",
+                "project_status": "technical_example",
+            }
+        assert payload["current_question_number"] == 1
+        assert payload["answers_by_question_before_latest_turn"][0] == [
+            "I'm proud of building job agents."
+        ]
+        if turn_text in {"What do job agents do? Don't you know that?", "Continue what?"}:
+            return {
+                "action": "detour",
+                "text": "Job agents automatically schedule work and monitor failures.",
+                "project_fragment": "",
+            }
+        raise AssertionError(f"Control reply was sent to model: {turn_text}")
+
+    session, adapter, spoken, calls, log = harness(tmp_path, infer)
+    await question_one(session, adapter)
+    await turn(adapter, "I'm proud of building job agents.")
+    follow_up = spoken[-1]
+    deliver(session)
+    await turn(adapter, "What do job agents do? Don't you know that?")
+    assert spoken[-1].text == "That can vary by project. I'd like to hear what yours did."
+    assert "continue or finish" not in spoken[-1].text.lower()
+    assert session.controller.answers[0] == ("I'm proud of building job agents.",)
+    deliver(session)
+    await asyncio.sleep(0)
+    assert session.controller.pending.text == follow_up.text
+    deliver(session)
+    await turn(adapter, "Continue what?")
+    assert spoken[-1].kind is UtteranceKind.DETOUR_ACK
+    deliver(session)
+    await asyncio.sleep(0)
+    deliver(session)
+    await turn(adapter, "Continue.")
+    assert spoken[-1].kind is UtteranceKind.DETOUR_RESUME
+    assert spoken[-1].text == follow_up.text
+    deliver(session)
+    await turn(adapter, "Continue.")
+    assert spoken[-1].kind is UtteranceKind.DETOUR_RESUME
+    assert session.controller.current_question_number == 1
+    assert session.controller.answers[0] == ("I'm proud of building job agents.",)
+    assert session.controller.stage is Stage.DELIVERING
+    assert not any(item.kind is UtteranceKind.EARLY_FEEDBACK for item in spoken)
+    rows = [json.loads(line) for line in log.path.read_text().splitlines()]
+    assert not any(row["event"] == "early_end_requested" for row in rows)
+    assert any(row["event"] == "model_detour_text_suppressed" for row in rows)
+    assert not any(
+        payload["phase"] == "continuation_choice" for _, payload in calls if _ == "decision"
+    )
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_choice_explanation_then_continue_is_applied_once(tmp_path):
+    async def infer(kind, payload):
+        if kind == "opening_ack":
+            return {"text": "Thanks."}
+        assert payload["phase"] != "continuation_choice"
+        return {"action": "off_topic", "text": ""}
+
+    session, adapter, spoken, calls, log = harness(tmp_path, infer)
+    await question_one(session, adapter)
+    await turn(adapter, "Can we discuss weekend plans?")
+    deliver(session)
+    await turn(adapter, "Continue what?")
+    assert "project question" in spoken[-1].text
+    deliver(session)
+    assert session.controller.stage is Stage.AWAITING_CONTINUE_CHOICE
+    await turn(adapter, "Continue.")
+    resumed = session.controller.pending
+    assert resumed.kind is UtteranceKind.DETOUR_RESUME
+    await turn(adapter, "Continue.")  # Barge in before the resumed question is heard.
+    assert session.controller.pending.text == QUESTIONS[0]
+    assert session.controller.pending.id != resumed.id
+    assert not session.controller.delivery_finished(resumed.id)
+    deliver(session)
+    assert session.controller.stage is Stage.AWAITING_ANSWER
+    await turn(adapter, "Continue.")  # Repeated control reply is not a project answer.
+    assert session.controller.stage is Stage.AWAITING_ANSWER
+    assert session.controller.answers[0] == ()
+    assert not any(item.kind is UtteranceKind.EARLY_FEEDBACK for item in spoken)
+    rows = [json.loads(line) for line in log.path.read_text().splitlines()]
+    assert (
+        len(
+            [
+                row
+                for row in rows
+                if row["event"] == "continuation_choice_proposed"
+                and row.get("action") == "continue"
+            ]
+        )
+        == 1
+    )
+    assert any(row["event"] == "duplicate_continuation_ignored" for row in rows)
+    assert not any(
+        payload["phase"] == "continuation_choice" for kind, payload in calls if kind == "decision"
+    )
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_choice_finish_and_ambiguous_recovery_have_distinct_reasons(tmp_path):
+    async def infer(kind, payload):
+        if kind == "opening_ack":
+            return {"text": "Thanks."}
+        if payload["phase"] == "continuation_choice":
+            return {"action": "advance", "text": ""}
+        if payload["latest_candidate_turn"] == "I built a planner.":
+            return {
+                "action": "follow_up",
+                "text": "What did you build yourself?",
+                "project_status": "technical_example",
+            }
+        return {"action": "off_topic", "text": ""}
+
+    finish, adapter, spoken, _, log = harness(tmp_path / "finish", infer)
+    await question_one(finish, adapter)
+    await turn(adapter, "Can we discuss weekend plans?")
+    deliver(finish)
+    await turn(adapter, "Finish.")
+    assert spoken[-1].kind is UtteranceKind.EARLY_FEEDBACK
+    rows = [json.loads(line) for line in log.path.read_text().splitlines()]
+    assert (
+        next(row for row in rows if row["event"] == "early_end_requested")["end_reason"]
+        == "user_request"
+    )
+    await finish.close()
+
+    ambiguous, adapter, spoken, _, log = harness(tmp_path / "ambiguous", infer)
+    await question_one(ambiguous, adapter)
+    await turn(adapter, "I built a planner.")
+    deliver(ambiguous)
+    await turn(adapter, "Can we discuss weekend plans?")
+    deliver(ambiguous)
+    for reply in ("Maybe", "Not sure"):
+        await turn(adapter, reply)
+        assert ambiguous.controller.stage is Stage.DELIVERING
+        deliver(ambiguous)
+    await turn(adapter, "Well")
+    assert spoken[-1].kind is UtteranceKind.EARLY_FEEDBACK
+    assert "you chose" not in spoken[-1].text.lower()
+    assert ambiguous.controller.answers[0] == ("I built a planner.",)
+    rows = [json.loads(line) for line in log.path.read_text().splitlines()]
+    early = next(row for row in rows if row["event"] == "early_end_requested")
+    assert early["end_reason"] == "recovery_limit"
+    assert early["speaker"] is None
+    await ambiguous.close()
+
+
+@pytest.mark.asyncio
+async def test_late_choice_inference_cannot_override_explicit_continue(tmp_path):
+    inference_started = asyncio.Event()
+
+    async def infer(kind, payload):
+        if kind == "opening_ack":
+            return {"text": "Thanks."}
+        if payload["phase"] == "continuation_choice":
+            inference_started.set()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                return {"action": "finish", "text": ""}
+        return {"action": "off_topic", "text": ""}
+
+    session, adapter, spoken, _, log = harness(tmp_path, infer)
+    await question_one(session, adapter)
+    await turn(adapter, "Can we discuss weekend plans?")
+    deliver(session)
+    await turn(adapter, "Maybe")
+    await inference_started.wait()
+    await turn(adapter, "Continue.")
+    await asyncio.sleep(0)
+    assert session.controller.pending.kind is UtteranceKind.DETOUR_RESUME
+    assert session.controller.pending.text == QUESTIONS[0]
+    assert not any(item.kind is UtteranceKind.EARLY_FEEDBACK for item in spoken)
+    rows = [json.loads(line) for line in log.path.read_text().splitlines()]
+    assert any(row["event"] == "inference_stale_discarded" for row in rows)
+    assert not any(row["event"] == "early_end_requested" for row in rows)
     await session.close()

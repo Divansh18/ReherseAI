@@ -245,6 +245,22 @@ def _presence_check(text: str) -> bool:
     return bool(re.match(r"^\s*(?:hello|hi|hey|are you there|can you hear me)\b", text, re.I))
 
 
+def _explicit_continuation_choice(text: str) -> str | None:
+    """Resolve clear replies to an offered choice without model inference."""
+    words = " ".join(re.findall(r"[a-z]+", text.lower().replace("’", "'")))
+    if re.fullmatch(r"continue what|continue with what", words):
+        return "explain"
+    if re.fullmatch(
+        r"(?:yes |yeah |please )?(?:continue|keep going|go on)"
+        r"(?: (?:with |the |my )*(?:interview|project|practice))?",
+        words,
+    ):
+        return "continue"
+    if re.fullmatch(r"(?:no |please )?(?:finish|end|stop)(?: here| now)?", words):
+        return "finish"
+    return None
+
+
 def _broad_discouragement(text: str) -> bool:
     return bool(
         re.search(
@@ -318,6 +334,8 @@ class InterviewSession:
         self._opening_interpret_text: str | None = None
         self._no_project_turn: str | None = None
         self._choice_turn: str | None = None
+        self._continued_prompt_id: int | None = None
+        self._end_reason = "user_request"
         self._interrupted_candidate_turn: str | None = None
         self._project_prompt_for_detour: Utterance | None = None
 
@@ -512,7 +530,13 @@ class InterviewSession:
             return
         if self._stop_latched:
             if self.controller.stage is Stage.EARLY_CLOSING:
-                if any(self.controller.answers):
+                if self._end_reason == "recovery_limit":
+                    await self._queue_speech(
+                        self.controller.prepare_early_feedback(
+                            "We'll pause the interview here. Thanks for sharing what you could."
+                        )
+                    )
+                elif any(self.controller.answers):
                     self._start_response()
                 else:
                     await self._queue_speech(
@@ -523,7 +547,43 @@ class InterviewSession:
             elif self.controller.interrupted_utterance is not None:
                 await self._queue_speech(self.controller.retry_interrupted())
             return
-
+        if (
+            self._continued_prompt_id is not None
+            and _explicit_continuation_choice(answer) == "continue"
+        ):
+            interrupted = self.controller.interrupted_utterance
+            if interrupted is not None and interrupted.id == self._continued_prompt_id:
+                retry = self.controller.retry_interrupted()
+                self._continued_prompt_id = retry.id
+                self._record("duplicate_continuation_ignored", speaker="candidate")
+                await self._queue_speech(retry)
+                return
+            if (
+                self.controller.stage is Stage.AWAITING_ANSWER
+                and self._last_project_prompt is not None
+                and self._last_project_prompt.id == self._continued_prompt_id
+            ):
+                self._record("duplicate_continuation_ignored", speaker="candidate")
+                return
+        self._continued_prompt_id = None
+        if _explicit_continuation_choice(answer) == "continue":
+            interrupted = self.controller.interrupted_utterance
+            if interrupted is not None and interrupted.kind in {
+                UtteranceKind.QUESTION,
+                UtteranceKind.FOLLOW_UP,
+                UtteranceKind.NUDGE,
+                UtteranceKind.CLARIFICATION,
+                UtteranceKind.DETOUR_RESUME,
+            }:
+                self._record("nonanswer_continuation", speaker="candidate")
+                await self._queue_speech(self.controller.retry_interrupted())
+                return
+            if self.controller.stage is Stage.AWAITING_ANSWER and self._last_project_prompt:
+                self._record("nonanswer_continuation", speaker="candidate")
+                await self._queue_speech(
+                    self.controller.restate_project_prompt(self._last_project_prompt)
+                )
+                return
         if await self._route_control_request(answer):
             return
 
@@ -565,6 +625,9 @@ class InterviewSession:
                 if utterance:
                     await self._queue_speech(utterance)
                 else:
+                    self._latest_candidate_turn = self.controller.answers[
+                        self.controller.current_question_number - 1
+                    ][-1]
                     self._start_response()
             return
 
@@ -604,6 +667,9 @@ class InterviewSession:
             if utterance:
                 await self._queue_speech(utterance)
             else:
+                self._latest_candidate_turn = self.controller.answers[
+                    self.controller.current_question_number - 1
+                ][-1]
                 self._start_response()
             return
 
@@ -926,10 +992,13 @@ class InterviewSession:
 
         return False
 
-    async def _end_early(self, request: str, *, defer_closing: bool = False) -> None:
+    async def _end_early(
+        self, request: str, *, defer_closing: bool = False, reason: str = "user_request"
+    ) -> None:
         if self._stop_latched:
             return
         self._stop_latched = True
+        self._end_reason = reason
         self._generation += 1
         task = self._response_task
         if task and task is not asyncio.current_task() and not task.done():
@@ -940,8 +1009,9 @@ class InterviewSession:
             self._speaking_id = None
             self._record(
                 "early_end_requested",
-                speaker="candidate",
+                speaker="candidate" if reason == "user_request" else None,
                 text=request,
+                end_reason=reason,
                 utterance_id=pending.id if pending else None,
                 detection_source="final_stt_segments" if defer_closing else "completed_turn",
             )
@@ -959,7 +1029,13 @@ class InterviewSession:
                 await self._cancel_audio()
             if defer_closing:
                 return
-            if any(self.controller.answers):
+            if reason == "recovery_limit":
+                await self._queue_speech(
+                    self.controller.prepare_early_feedback(
+                        "We'll pause the interview here. Thanks for sharing what you could."
+                    )
+                )
+            elif any(self.controller.answers):
                 self._start_response()
             else:
                 await self._queue_speech(
@@ -1020,6 +1096,7 @@ class InterviewSession:
             "remaining_detours": self.controller.remaining_detours,
             "answers_before_latest_turn": list(self._answer_snapshot or ()),
             "pending_continuation_choice": self.controller.stage is Stage.AWAITING_CONTINUE_CHOICE,
+            "early_end_reason": self._end_reason,
             "interrupted_output_started": self._interrupted_output_id is not None,
             "latest_candidate_turn": self._latest_candidate_turn,
         }
@@ -1117,7 +1194,27 @@ class InterviewSession:
             speech = "You can call me RehearseAI."
         else:
             kind = UtteranceKind.DETOUR_ACK
-            if not isinstance(text, str) or not text.strip() or len(text) > 180 or "?" in text:
+            project_prompt = (
+                self.controller.interrupted_utterance
+                if interrupted
+                else self._project_prompt_for_detour
+            )
+            if (
+                self.controller.current_question_number == 1
+                and self.controller.remaining_follow_ups == 0
+                and project_prompt is not None
+                and project_prompt.kind
+                in {UtteranceKind.FOLLOW_UP, UtteranceKind.NUDGE, UtteranceKind.DETOUR_RESUME}
+            ):
+                # The candidate owns the project's meaning; a generic model
+                # definition here could turn an ambiguous label into a fact.
+                speech = "That can vary by project. I'd like to hear what yours did."
+                self._record(
+                    "model_detour_text_suppressed",
+                    speaker=None,
+                    reason="candidate_project_details_unverified",
+                )
+            elif not isinstance(text, str) or not text.strip() or len(text) > 180 or "?" in text:
                 speech = "I can help with this interview practice."
             elif "call me rehearseai" in text.lower() and not _asks_coach_identity(
                 self._latest_candidate_turn
@@ -1125,7 +1222,11 @@ class InterviewSession:
                 speech = "I can help with this interview practice."
             else:
                 speech = text.strip()
-        spoken = f"{speech} Would you like to continue or finish?"
+        spoken = (
+            f"{speech} Would you like to continue or finish?"
+            if kind in {UtteranceKind.PROVISIONAL_FEEDBACK, UtteranceKind.TOPIC_BOUNDARY}
+            else speech
+        )
         if interrupted:
             utterance = self.controller.start_interrupted_detour(spoken, kind=kind)
         else:
@@ -1230,27 +1331,41 @@ class InterviewSession:
                 and self._choice_turn is not None
             ):
                 turn = self._choice_turn
-                self._record(
-                    "inference_started",
-                    speaker=None,
-                    generation=generation,
-                    purpose="continuation_choice",
-                )
-                inference_purpose = "continuation_choice"
-                result = await self._infer_decision(
-                    {**self._payload(), "phase": "continuation_choice"}, generation
-                )
-                inference_returned = True
+                explicit = _explicit_continuation_choice(turn)
+                if explicit is None:
+                    self._record(
+                        "inference_started",
+                        speaker=None,
+                        generation=generation,
+                        purpose="continuation_choice",
+                    )
+                    inference_purpose = "continuation_choice"
+                    result = await self._infer_decision(
+                        {**self._payload(), "phase": "continuation_choice"}, generation
+                    )
+                    inference_returned = True
+                    action = str(result.get("action", "")).upper()
+                    if action not in {"CONTINUE", "OFF_TOPIC", "WAIT"}:
+                        self._record(
+                            "proposal_rejected",
+                            speaker=None,
+                            generation=generation,
+                            action=action.lower(),
+                            reason="choice_requires_explicit_finish",
+                        )
+                        action = "WAIT"
+                else:
+                    action = explicit.upper()
                 if generation != self._generation or self._closed:
                     self._record("inference_stale_discarded", speaker=None, generation=generation)
                     return
                 self._choice_turn = None
-                action = str(result.get("action", "")).upper()
                 self._record(
                     "continuation_choice_proposed",
                     speaker=None,
                     generation=generation,
                     action=action.lower(),
+                    source="explicit" if explicit else "model",
                 )
                 if action == "CONTINUE":
                     utterance = self.controller.continue_interview()
@@ -1261,16 +1376,19 @@ class InterviewSession:
                         self._latest_candidate_turn = answers[-1]
                         self._start_response()
                     else:
+                        self._continued_prompt_id = utterance.id
                         await self._queue_speech(utterance)
-                elif action in {"FINISH", "END"}:
+                elif action == "FINISH":
                     await self._end_early(turn)
                 else:
                     utterance = self.controller.repeat_continuation_choice(
-                        off_topic=action == "OFF_TOPIC", presence=_presence_check(turn)
+                        off_topic=action == "OFF_TOPIC",
+                        presence=_presence_check(turn),
+                        explain=action == "EXPLAIN",
                     )
                     if utterance is None:
                         self._record("continuation_choice_exhausted", speaker=None)
-                        await self._end_early(turn)
+                        await self._end_early(turn, reason="recovery_limit")
                     else:
                         await self._queue_speech(utterance)
                 return
@@ -1516,7 +1634,7 @@ class InterviewSession:
                     )
                     if utterance is None:
                         self._record("no_project_choice_exhausted", speaker=None)
-                        await self._end_early(turn)
+                        await self._end_early(turn, reason="recovery_limit")
                     else:
                         await self._queue_speech(utterance)
                 return
@@ -1961,6 +2079,9 @@ class InterviewSession:
             elif self.controller.stage is Stage.AWAITING_DETOUR_RETURN:
                 next_utterance = self.controller.resume_detour()
                 if next_utterance is None:
+                    self._latest_candidate_turn = self.controller.answers[
+                        self.controller.current_question_number - 1
+                    ][-1]
                     self._start_response()
                 else:
                     asyncio.create_task(self._queue_speech(next_utterance))
