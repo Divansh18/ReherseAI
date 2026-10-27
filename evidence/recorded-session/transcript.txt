@@ -1,0 +1,30 @@
+Server-observed transcript. Agent output start/completion does not confirm browser playback or human hearing. Candidate text is the accumulated final STT turn.
+
+RehearseAI: Hey, I'm RehearseAI, your AI interview coach. How's your day going?
+You: It's going pretty well. How about you?
+RehearseAI: Doing well, thanks for asking. What should I call you?
+You: Even call me Divanj.
+RehearseAI: Nice to meet you, Divanj. Ready to jump in?
+You: Yeah. Let's go.
+RehearseAI: Tell me about a project you're proud of.
+You: So I have built a project named GraphAI. It is a tool that reviews GitHub pull requests and kind of post a structured risk report as a command. So the idea is to help developers identify risk changes before merging the code into production. Right? So I build this application independently from GitHub integration analysis flow and dashboard. So that's it.
+RehearseAI: What were the hardest technical challenges you faced while building GraphAI, and how did you address them?
+You: So one change was handling data for books. And connecting each event to the repository and analysis. So I needed to, you know, kinda understand which event should trigger a review and how to handle
+You: failure. Right? So and how I handle it, I separated the web book handlings. From the analysis logic and tested using a pull request. So that helped me trace whether a failure happened when receiving the event, analyst... Analyze the changes, or posting the comment.
+RehearseAI: What was the hardest technical problem in it?
+You: I told you, no, one challenge was handling it up Webhooks. So handling GitHub books was the hardest.
+RehearseAI: Could you explain more about what made handling GitHub webhooks the hardest technical problem?
+You: Because we need to attach correct event
+You: We need to connect each event to the correct repository analysis. That makes it the hardest part.
+RehearseAI: How did you know it was working well?
+You: So I tested it with the real pull and manually reverted the general PR comments. That's how I tested it.
+RehearseAI: Could you briefly explain what you mean by manually reverting the general PR comments during your testing?
+You: I mean, manually reviewing the comments.
+RehearseAI: What would you do differently now?
+You: I think I would add a fallback model Like, I was using Claude and... But I don't have any fallback model, so I would use another fallback model. Like OpenAI.
+RehearseAI: What would you consider when choosing and integrating a fallback model like OpenAI?
+You: So what I want is you to give a feedback so far.
+RehearseAI: You've clearly explained your project and a thoughtful improvement, demonstrating problem-solving and adaptability. To improve, share more details about how you'd implement the fallback model for clearer impact. Would you like to continue or finish?
+You: I want to finish the interview.
+RehearseAI: Thank you, Divanj, for sharing your project and insights before deciding to finish early.
+It was great to learn about your thoughtful approach to handling webhook events and fallback models.
