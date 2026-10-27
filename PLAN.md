@@ -19,9 +19,9 @@ The controller first introduces RehearseAI as an AI interview coach and asks abo
 | --- | --- |
 | 1. Foundation | Complete: package, `uv` lock, configuration template, checks, foundation commit. |
 | 2. Interview policy | Complete: four-question delivery-aware state machine and deterministic tests. |
-| 3. Local voice loop | Implemented: cascaded Pipecat services, loopback SmallWebRTC server, browser, prompt files, and session logging. Real sessions revealed turn and lifecycle faults. Current fixes are offline-tested; the next real voice check is pending. |
-| 4. Observability and prompts | Added correlated server monotonic timing for STT, turns, inference, TTS, output, cancellation, and delivery. Prompt relevance and timing improvements require real-session verification. |
-| 5. Real-session verification | Pending: rerun a genuine session on the fix, inspect four-question order, relevance, brief feedback, pause/barge-in handling, and measured latency. Fix any observed faults and finalize troubleshooting docs. |
+| 3. Local voice loop | Implemented: cascaded Pipecat services, loopback SmallWebRTC server, browser, prompt files, and session logging. Subsequent real development sessions revealed and informed turn, TTS, and routing fixes. |
+| 4. Observability and prompts | Implemented: correlated server monotonic timing for STT, turns, inference, TTS, output, cancellation, and delivery; exact versioned prompts and recorded iterations. Browser playback onset and LLM first-token timing remain unavailable. |
+| 5. Submission evidence | Pending: record one 3–5 minute four-question session with normal answer, mid-answer pause, and barge-in; export matching transcript and latency; verify the final spoken behavior and fill in author time spent. See `RECORDING.md` and `SUBMISSION_CHECKLIST.md`. |
 
 ## Delivery and interruption contract
 
