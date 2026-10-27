@@ -166,3 +166,22 @@ def test_legacy_prestart_without_segment_count_is_not_inferred() -> None:
     )
     assert rows[0]["stt_final_ms"] is None
     assert rows[0]["stt_final_basis"] == "ambiguous_segment_correlation"
+
+
+def test_single_explicitly_correlated_prestart_segment_is_exported() -> None:
+    rows, _, _ = build_export(
+        [
+            event(
+                1,
+                10,
+                "stt_final_segment",
+                turn_number=1,
+                turn_correlation="pre_start_segment",
+                text="Only segment",
+            ),
+            event(2, 20, "candidate_started", turn_number=1),
+            event(3, 30, "candidate_final", turn_number=1, text="Only segment", segment_count=1),
+        ]
+    )
+    assert rows[0]["stt_final_ms"] == 10
+    assert rows[0]["stt_final_basis"] == "logged_turn_number_and_accumulated_text"
