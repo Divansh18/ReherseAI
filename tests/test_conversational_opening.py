@@ -24,6 +24,8 @@ def make_session(tmp_path, infer=None):
         if kind == "opening_ack":
             response = payload["greeting_response"].lower()
             return {"text": "Doing well, thanks!" if "how" in response else "Thanks for sharing."}
+        if payload["phase"] == "continuation_choice":
+            return {"action": "continue", "text": "", "project_fragment": ""}
         return {"action": "wait", "text": "", "project_fragment": ""}
 
     async def speak(utterance):
@@ -158,10 +160,12 @@ async def test_name_detour_after_question_one_preserves_limits(tmp_path):
     assert spoken[-1].kind is UtteranceKind.DETOUR_ACK
     deliver(session)
     await settle()
+    assert session.controller.stage is Stage.AWAITING_CONTINUE_CHOICE
+    await turn(adapter, "Continue.")
     assert spoken[-1].text == QUESTIONS[0]
     assert session.controller.remaining_follow_ups == 1
     assert session.controller.remaining_clarifications == 1
-    assert [kind for kind, _ in calls] == ["opening_ack"]
+    assert [kind for kind, _ in calls] == ["opening_ack", "decision"]
     await session.close()
 
 
@@ -178,6 +182,8 @@ async def test_detour_after_partial_answer_keeps_answer_and_decides_once(tmp_pat
     await turn(adapter, "Divansh.")
     deliver(session)
     await settle()
+    assert session.controller.stage is Stage.AWAITING_CONTINUE_CHOICE
+    await turn(adapter, "Continue.")
     assert session.controller.answers[0] == ("I built a parser for risk reports.",)
     assert session.controller.remaining_follow_ups == 1
     assert session.controller.remaining_clarifications == 1
@@ -193,6 +199,8 @@ async def test_name_detour_replays_unanswered_follow_up_without_spending_budget(
         calls.append((kind, payload))
         if kind == "opening_ack":
             return {"text": "Sounds good."}
+        if payload["phase"] == "continuation_choice":
+            return {"action": "continue", "text": "", "project_fragment": ""}
         return {"action": "follow_up", "text": "What did you build?", "project_fragment": ""}
 
     session, adapter, spoken, _unused, _log = make_session(tmp_path, infer)
@@ -213,11 +221,13 @@ async def test_name_detour_replays_unanswered_follow_up_without_spending_budget(
     await turn(adapter, "Divansh.")
     deliver(session)
     await settle()
+    assert session.controller.stage is Stage.AWAITING_CONTINUE_CHOICE
+    await turn(adapter, "Continue.")
     assert spoken[-1].text == "What did you build?"
     assert spoken[-1].kind is UtteranceKind.DETOUR_RESUME
     assert session.controller.answers[0] == ("I built a parser.",)
     assert session.controller.remaining_follow_ups == 0
-    assert len([kind for kind, _ in calls if kind == "decision"]) == 1
+    assert len([kind for kind, _ in calls if kind == "decision"]) == 2
     await session.close()
 
 
@@ -232,7 +242,7 @@ async def test_structured_general_detour_restores_project_answer(tmp_path):
         if payload["latest_candidate_turn"].startswith("The parser"):
             return {
                 "action": "detour",
-                "text": "I'm an AI coach; you can call me RehearseAI.",
+                "text": "I'm an AI interview coach.",
                 "project_fragment": "The parser checks PRs.",
             }
         return {"action": "wait", "text": "", "project_fragment": ""}
@@ -251,6 +261,8 @@ async def test_structured_general_detour_restores_project_answer(tmp_path):
     assert session.controller.answers[0] == ("The parser checks PRs.",)
     deliver(session)
     await settle()
+    assert session.controller.stage is Stage.AWAITING_CONTINUE_CHOICE
+    assert spoken[-1].kind is UtteranceKind.DETOUR_ACK
     assert session.controller.answers[0] == ("The parser checks PRs.",)
     assert session.controller.remaining_follow_ups == 1
     await session.close()

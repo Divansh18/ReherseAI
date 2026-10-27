@@ -43,6 +43,7 @@ class Stage(Enum):
     AWAITING_NAME = auto()
     AWAITING_OPENING_RETURN = auto()
     AWAITING_DETOUR_RETURN = auto()
+    AWAITING_CONTINUE_CHOICE = auto()
     AWAITING_QUESTION_START = auto()
     AWAITING_READINESS = auto()
     AWAITING_ANSWER = auto()
@@ -76,6 +77,8 @@ class UtteranceKind(Enum):
     OPENING_COACH_REPLY = auto()
     DETOUR_ACK = auto()
     DETOUR_RESUME = auto()
+    PROVISIONAL_FEEDBACK = auto()
+    TOPIC_BOUNDARY = auto()
     OPENING_ACK = auto()
     READINESS = auto()
     OPENING_WAIT = auto()
@@ -131,6 +134,7 @@ class InterviewController:
         self._name_repeats = 0
         self._detour_resume_prompt: Utterance | None = None
         self._detours = [0] * len(QUESTIONS)
+        self._choice_repeats = 0
         self._opening_return_to_name = False
         self._opening_coach_replies = 0
         self._project_established: bool | None = None
@@ -208,6 +212,13 @@ class InterviewController:
             return MAX_CLARIFICATIONS_PER_QUESTION
         return MAX_CLARIFICATIONS_PER_QUESTION - self._clarifications[self._question_index]
 
+    def remaining_prompts_for(self, question_number: int) -> tuple[int, int]:
+        index = question_number - 1
+        return (
+            MAX_FOLLOW_UPS_PER_QUESTION - self._follow_ups[index],
+            MAX_CLARIFICATIONS_PER_QUESTION - self._clarifications[index],
+        )
+
     def start(self) -> Utterance:
         self._require(Stage.NEW)
         return self._prepare(UtteranceKind.GREETING, GREETING, None)
@@ -269,7 +280,12 @@ class InterviewController:
             self._name_declined = True
             acknowledgement = "No problem."
         if self._name_detour:
-            return self._prepare(UtteranceKind.DETOUR_ACK, acknowledgement, self._question_index)
+            self._name_detour = False
+            return self._prepare(
+                UtteranceKind.DETOUR_ACK,
+                f"{acknowledgement} Would you like to continue or finish?",
+                self._question_index,
+            )
         if readiness is Readiness.READY:
             return self._prepare(UtteranceKind.NAME_ACK, acknowledgement, None)
         if readiness is Readiness.DEFERRED:
@@ -315,6 +331,13 @@ class InterviewController:
     def skip_name_for_start(self) -> Utterance:
         self._require(Stage.AWAITING_NAME)
         self._name_declined = True
+        if self._name_detour:
+            self._name_detour = False
+            return self._prepare(
+                UtteranceKind.DETOUR_ACK,
+                "Okay. Would you like to continue or finish?",
+                self._question_index,
+            )
         kind = UtteranceKind.DETOUR_ACK if self._name_detour else UtteranceKind.NAME_ACK
         return self._prepare(
             kind, "Okay, let's begin.", self._question_index if self._name_detour else None
@@ -325,32 +348,93 @@ class InterviewController:
             raise InvalidTransition(f"Cannot start a detour from {self._stage.name}")
         index = self._question_index
         self._detours[index] = min(self._detours[index] + 1, 2)
-        self._name_detour = True
         self._detour_resume_prompt = resume_prompt
         if self._preferred_name:
+            self._name_detour = False
             return self._prepare(
                 UtteranceKind.DETOUR_ACK,
-                f"You can call me RehearseAI, and I have you as {self._preferred_name}.",
+                f"I have you as {self._preferred_name}. Would you like to continue or finish?",
                 index,
             )
         if self._name_declined:
+            self._name_detour = False
             return self._prepare(
-                UtteranceKind.DETOUR_ACK, "No need to share a name. We can carry on.", index
+                UtteranceKind.DETOUR_ACK,
+                "No need to share a name. Would you like to continue or finish?",
+                index,
             )
+        self._name_detour = True
         return self._prepare(
             UtteranceKind.NAME_PROMPT,
             "You're right, I didn't ask. What should I call you?",
             index,
         )
 
-    def start_general_detour(self, text: str, resume_prompt: Utterance | None = None) -> Utterance:
+    def start_general_detour(
+        self,
+        text: str,
+        resume_prompt: Utterance | None = None,
+        *,
+        kind: UtteranceKind = UtteranceKind.DETOUR_ACK,
+    ) -> Utterance:
         self._require(Stage.AWAITING_PROPOSAL)
+        if kind not in {
+            UtteranceKind.DETOUR_ACK,
+            UtteranceKind.PROVISIONAL_FEEDBACK,
+            UtteranceKind.TOPIC_BOUNDARY,
+        }:
+            raise ValueError("Invalid conversational response kind")
         exhausted = self._detours[self._question_index] >= 2
         self._detours[self._question_index] = min(self._detours[self._question_index] + 1, 2)
         self._detour_resume_prompt = resume_prompt
-        if exhausted:
-            text = "Let's return to the project question when you're ready."
-        return self._prepare(UtteranceKind.DETOUR_ACK, text, self._question_index)
+        if exhausted and kind is UtteranceKind.TOPIC_BOUNDARY:
+            text = "I can only help with interview practice here. Continue or finish?"
+        return self._prepare(kind, text, self._question_index)
+
+    def start_interrupted_detour(
+        self, text: str, *, kind: UtteranceKind = UtteranceKind.DETOUR_ACK
+    ) -> Utterance:
+        self._require(Stage.DELIVERING)
+        if self._interrupted is None:
+            raise InvalidTransition("There is no interrupted project prompt")
+        if kind not in {
+            UtteranceKind.DETOUR_ACK,
+            UtteranceKind.PROVISIONAL_FEEDBACK,
+            UtteranceKind.TOPIC_BOUNDARY,
+        }:
+            raise ValueError("Invalid conversational response kind")
+        index = self._index_for(self._interrupted)
+        self._detour_resume_prompt = self._interrupted
+        self._interrupted = None
+        if index is not None:
+            self._detours[index] = min(self._detours[index] + 1, 2)
+        return self._prepare(kind, text, index)
+
+    def continue_interview(self) -> Utterance | None:
+        self._require(Stage.AWAITING_CONTINUE_CHOICE)
+        prompt = self._detour_resume_prompt
+        self._detour_resume_prompt = None
+        self._choice_repeats = 0
+        if prompt is not None:
+            return self._prepare(UtteranceKind.DETOUR_RESUME, prompt.text, self._index_for(prompt))
+        if self._question_index >= 0 and self._answers[self._question_index]:
+            self._stage = Stage.AWAITING_PROPOSAL
+            return None
+        return self._prepare(
+            UtteranceKind.DETOUR_RESUME, QUESTIONS[self._question_index], self._question_index
+        )
+
+    def repeat_continuation_choice(self, *, off_topic: bool = False) -> Utterance | None:
+        self._require(Stage.AWAITING_CONTINUE_CHOICE)
+        if self._choice_repeats >= 1:
+            return None
+        self._choice_repeats += 1
+        text = (
+            "This session is for interview practice. Continue with your project or finish?"
+            if off_topic
+            else "Would you like to continue the interview or finish here?"
+        )
+        return self._prepare(UtteranceKind.TOPIC_BOUNDARY, text, self._question_index)
 
     def restore_answers(self, answers: tuple[str, ...]) -> None:
         self._require(Stage.AWAITING_PROPOSAL)
@@ -633,8 +717,16 @@ class InterviewController:
             self._stage = Stage.AWAITING_NAME
         elif utterance.kind is UtteranceKind.OPENING_COACH_REPLY:
             self._stage = Stage.AWAITING_OPENING_RETURN
-        elif utterance.kind is UtteranceKind.DETOUR_ACK:
-            self._stage = Stage.AWAITING_DETOUR_RETURN
+        elif utterance.kind in {
+            UtteranceKind.DETOUR_ACK,
+            UtteranceKind.PROVISIONAL_FEEDBACK,
+            UtteranceKind.TOPIC_BOUNDARY,
+        }:
+            self._stage = (
+                Stage.AWAITING_DETOUR_RETURN
+                if self._name_detour
+                else Stage.AWAITING_CONTINUE_CHOICE
+            )
         elif utterance.kind is UtteranceKind.NO_PROJECT_INVITE:
             self._stage = Stage.AWAITING_NO_PROJECT_EXAMPLE
         elif utterance.kind is UtteranceKind.NO_PROJECT_SCOPE:
@@ -645,7 +737,7 @@ class InterviewController:
             UtteranceKind.OPENING_CLARIFICATION,
         }:
             self._stage = Stage.AWAITING_READINESS
-        elif utterance.kind is UtteranceKind.QUESTION:
+        elif utterance.kind in {UtteranceKind.QUESTION, UtteranceKind.DETOUR_RESUME}:
             if utterance.question_number is None:
                 raise RuntimeError("Question utterance has no question number")
             self._question_index = utterance.question_number - 1
@@ -700,8 +792,16 @@ class InterviewController:
             self._stage = Stage.AWAITING_OPENING_RETURN
         elif interrupted.kind is UtteranceKind.NAME_ACK:
             self._stage = Stage.AWAITING_QUESTION_START
-        elif interrupted.kind is UtteranceKind.DETOUR_ACK:
-            self._stage = Stage.AWAITING_DETOUR_RETURN
+        elif interrupted.kind in {
+            UtteranceKind.DETOUR_ACK,
+            UtteranceKind.PROVISIONAL_FEEDBACK,
+            UtteranceKind.TOPIC_BOUNDARY,
+        }:
+            self._stage = (
+                Stage.AWAITING_DETOUR_RETURN
+                if self._name_detour
+                else Stage.AWAITING_CONTINUE_CHOICE
+            )
         elif interrupted.kind is UtteranceKind.NO_PROJECT_INVITE:
             self._stage = Stage.AWAITING_NO_PROJECT_EXAMPLE
         elif interrupted.kind is UtteranceKind.NO_PROJECT_SCOPE:
@@ -716,7 +816,7 @@ class InterviewController:
             self._closing_remarks.append(answer)
             self._stage = Stage.AWAITING_FEEDBACK
         else:
-            if interrupted.kind is UtteranceKind.QUESTION:
+            if interrupted.kind in {UtteranceKind.QUESTION, UtteranceKind.DETOUR_RESUME}:
                 if interrupted.question_number is None:
                     raise RuntimeError("Question utterance has no question number")
                 self._question_index = interrupted.question_number - 1

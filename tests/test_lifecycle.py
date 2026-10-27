@@ -495,8 +495,9 @@ async def test_speech_before_first_output_retries_unheard_question(tmp_path):
     input_adapter = InterviewInput()
     input_adapter.push_frame = lambda *_args, **_kwargs: asyncio.sleep(0)
 
-    async def infer(_kind, _payload):
-        raise AssertionError("No inference should run for unheard question")
+    async def infer(_kind, payload):
+        assert payload["phase"] == "interrupted_turn"
+        return {"action": "wait", "text": ""}
 
     log = SessionLog(tmp_path, "startup")
     session = InterviewSession(log, infer, input_adapter.speak, lambda _: None)
@@ -504,6 +505,7 @@ async def test_speech_before_first_output_retries_unheard_question(tmp_path):
     await start_questions(session)
     first_id = session.controller.pending.id
     await feed_turn(input_adapter, ["I am proud of a project I built."])
+    await settle()
     assert session.controller.answers == ((), (), (), ())
     assert session.controller.pending.id != first_id
     assert session.controller.pending.text == QUESTIONS[0]
@@ -707,8 +709,9 @@ async def test_unheard_next_question_routes_continuation_to_previous_answer(tmp_
     assert spoken[-1].text == QUESTIONS[1]
     assert spoken[-1].id != unheard.id
     assert not session.controller.delivery_finished(unheard.id)
-    assert payloads[-1][1]["current_question"] == QUESTIONS[0]
-    assert len(payloads) == 1  # No new LLM decision from the unheard question.
+    assert payloads[-1][1]["current_question"] == QUESTIONS[1]
+    assert payloads[-1][1]["last_delivered_prompt"] == QUESTIONS[0]
+    assert len(payloads) == 2  # One interpretation for each completed candidate turn.
     await session.close()
 
 

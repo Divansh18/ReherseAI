@@ -48,7 +48,20 @@ DECISION_SCHEMA = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["follow_up", "nudge", "clarification", "wait", "advance", "detour", "end"],
+            "enum": [
+                "follow_up",
+                "nudge",
+                "clarification",
+                "wait",
+                "advance",
+                "detour",
+                "feedback_request",
+                "off_topic",
+                "coach_identity",
+                "continue",
+                "finish",
+                "end",
+            ],
         },
         "text": {"type": "string"},
         "project_fragment": {"type": "string"},
