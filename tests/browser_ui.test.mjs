@@ -227,6 +227,7 @@ test('closing feedback drains before automatic cleanup, then freezes timer and p
   send({ event: 'agent_output_started', utterance_id: 8 });
   send({ event: 'agent_delivery_reported', utterance_id: 8 });
   send({ event: 'interview_complete' });
+  assert.equal(nodes['phase-label'].textContent, 'Interview complete');
   assert.equal(track.readyState, 'live');
   assert.equal(timeouts.size, 1);
   assert.equal(nodes['question-progress'].children[3].dataset.state, 'complete');
@@ -236,6 +237,7 @@ test('closing feedback drains before automatic cleanup, then freezes timer and p
   assert.equal(nodes.connection.textContent, 'Ended');
   assert.equal(nodes.microphone.textContent, 'Microphone off');
   assert.equal(nodes.start.textContent, 'Start again');
+  assert.equal(nodes['phase-label'].textContent, 'Interview complete');
   assert.equal(nodes.transcript.children[0].textContent.includes('Good work.'), true);
   assert.equal(intervals.size, 0);
   send({ event: 'agent_prepared', utterance_id: 9, text: 'Late question.' });

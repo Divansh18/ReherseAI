@@ -198,7 +198,7 @@ function handleEvent(message) {
     guidance.textContent = 'Take your time; keep going when you’re ready.';
     if (errorLabel.hidden) setStatus('Listening');
   } else if (entry.event === 'interview_complete') {
-    setInterviewPhase('Complete', 'Your feedback is in the conversation.', 'Finishing the closing audio.');
+    setInterviewPhase('Interview complete', 'Your feedback is in the conversation.', 'Finishing the closing audio.');
     questionCount.hidden = true;
     setProgress(4, true);
     scheduleAutomaticEnd();

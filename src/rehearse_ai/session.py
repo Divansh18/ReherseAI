@@ -1705,9 +1705,33 @@ class InterviewSession:
                     validated=True,
                 )
                 lines = result.get("lines")
-                if not isinstance(lines, list) or not all(isinstance(line, str) for line in lines):
-                    raise ValueError("Feedback response did not contain lines")
-                await self._queue_speech(self.controller.prepare_feedback("\n".join(lines)))
+                if (
+                    not isinstance(lines, list)
+                    or len(lines) != 2
+                    or any(
+                        not isinstance(line, str)
+                        or not line.strip()
+                        or len(line) > 160
+                        or "\n" in line
+                        or "?" in line
+                        or not line.strip().endswith((".", "!"))
+                        or re.search(r"[.!?]\s+\S", line.strip()[:-1])
+                        or "end the session" in line.lower()
+                        for line in lines
+                    )
+                ):
+                    raise ValueError("Feedback response must contain two short sentences")
+                name = self.controller.preferred_name
+                address = f", {name}" if name else ""
+                sign_off = (
+                    f"That wraps up our practice interview{address}—thanks for sharing, "
+                    "and come back anytime."
+                )
+                await self._queue_speech(
+                    self.controller.prepare_feedback(
+                        "\n".join([*(line.strip() for line in lines), sign_off])
+                    )
+                )
 
             if self.controller.stage is Stage.EARLY_CLOSING:
                 self._record(
