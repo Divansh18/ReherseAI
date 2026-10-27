@@ -8,6 +8,9 @@ const questionLabel = document.querySelector('#question');
 const questionCount = document.querySelector('#question-count');
 const guidance = document.querySelector('#guidance');
 const transcript = document.querySelector('#transcript');
+const jumpLatest = document.querySelector('#jump-latest');
+const elapsed = document.querySelector('#elapsed');
+const progressTrack = document.querySelector('#question-progress');
 const errorLabel = document.querySelector('#error');
 const audio = document.querySelector('#remote-audio');
 let peer = null;
@@ -18,6 +21,42 @@ const prepared = new Map();
 const answers = new Map();
 let attempt = 0;
 let offerAbort = null;
+let sessionClosed = true;
+let terminalPending = false;
+let cleanupTimeout = null;
+let timerInterval = null;
+let timerStartedAt = null;
+
+function renderElapsed() {
+  const seconds = timerStartedAt === null ? 0 : Math.floor((Date.now() - timerStartedAt) / 1000);
+  elapsed.textContent = `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+}
+
+function stopTimer() {
+  if (timerInterval !== null) clearInterval(timerInterval);
+  timerInterval = null;
+  if (timerStartedAt !== null) renderElapsed();
+  timerStartedAt = null;
+}
+
+function startTimer() {
+  if (timerInterval !== null || timerStartedAt !== null) return;
+  timerStartedAt = Date.now();
+  renderElapsed();
+  timerInterval = setInterval(renderElapsed, 1000);
+}
+
+function setProgress(questionNumber = 0, complete = false) {
+  const segments = progressTrack.querySelectorAll('span');
+  segments.forEach((segment, index) => {
+    const state = complete || index + 1 < questionNumber ? 'complete'
+      : index + 1 === questionNumber ? 'active' : '';
+    if (state) segment.dataset.state = state;
+    else delete segment.dataset.state;
+  });
+  progressTrack.setAttribute('aria-label', complete ? 'All four questions complete'
+    : questionNumber ? `Question ${questionNumber} of 4` : 'Interview has not started');
+}
 
 function microphoneState() {
   return microphone?.getAudioTracks().some((track) => track.readyState === 'live')
@@ -62,18 +101,42 @@ function nearTranscriptBottom() {
 }
 
 function scrollIfNear(nearBottom) {
-  if (nearBottom) transcript.scrollTop = transcript.scrollHeight;
+  if (nearBottom) {
+    transcript.scrollTop = transcript.scrollHeight;
+    jumpLatest.hidden = true;
+  } else {
+    jumpLatest.hidden = false;
+  }
 }
+
+transcript.addEventListener('scroll', () => {
+  if (nearTranscriptBottom()) jumpLatest.hidden = true;
+});
+jumpLatest.addEventListener('click', () => {
+  transcript.scrollTop = transcript.scrollHeight;
+  jumpLatest.hidden = true;
+  transcript.focus();
+});
 
 function addTurn(speaker, text, id = null) {
   const nearBottom = nearTranscriptBottom();
   transcript.querySelector('.empty')?.remove();
   const item = document.createElement('li');
   item.className = speaker === 'candidate' ? 'candidate' : 'agent';
+  const avatar = document.createElement('span');
+  avatar.className = 'avatar';
+  avatar.setAttribute('aria-hidden', 'true');
+  avatar.textContent = speaker === 'candidate' ? 'Y' : 'R';
+  const message = document.createElement('div');
+  message.className = 'message';
   const label = document.createElement('span');
   label.className = 'speaker';
   label.textContent = speaker === 'candidate' ? 'You' : 'RehearseAI';
-  item.append(label, document.createTextNode(text));
+  const copy = document.createElement('span');
+  copy.className = 'message-copy';
+  copy.textContent = text;
+  message.append(label, copy);
+  item.append(avatar, message);
   transcript.append(item);
   scrollIfNear(nearBottom);
   if (id !== null) utterances.set(id, item);
@@ -85,16 +148,18 @@ function markInterrupted(item) {
   const annotation = document.createElement('span');
   annotation.className = 'annotation';
   annotation.textContent = 'Interrupted';
-  item.append(annotation);
+  item.querySelector('.message').append(annotation);
 }
 
 function handleEvent(message) {
   if (message.type !== 'rehearseai') return;
   const entry = message.event;
   if (!entry || !entry.event) return;
+  if (terminalPending || sessionClosed && attempt > 0) return;
 
   if (entry.event === 'session_started') {
     document.querySelector('#session-id').textContent = `Session ${entry.session_id}`;
+    startTimer();
   } else if (entry.event === 'candidate_started') {
     if (errorLabel.hidden) setStatus('Listening');
   } else if (entry.event === 'candidate_turn_completed') {
@@ -113,6 +178,7 @@ function handleEvent(message) {
       setInterviewPhase('Current question', pending.text, 'Take your time with your answer.');
       questionCount.textContent = `${String(pending.question_number).padStart(2, '0')} / 04`;
       questionCount.hidden = false;
+      setProgress(pending.question_number);
     }
     setStatus('Speaking');
   } else if (entry.event === 'agent_interrupted') {
@@ -127,7 +193,7 @@ function handleEvent(message) {
     const previous = answers.get(answerNumber);
     if (previous) {
       const nearBottom = nearTranscriptBottom();
-      previous.append(document.createTextNode(` ${entry.text}`));
+      previous.querySelector('.message-copy').append(document.createTextNode(` ${entry.text}`));
       scrollIfNear(nearBottom);
     } else {
       answers.set(answerNumber, addTurn('candidate', entry.text));
@@ -136,13 +202,14 @@ function handleEvent(message) {
     guidance.textContent = 'Take your time; keep going when you’re ready.';
     if (errorLabel.hidden) setStatus('Listening');
   } else if (entry.event === 'interview_complete') {
-    setInterviewPhase('Complete', 'Your feedback is in the conversation.', 'Select End session to release your microphone.');
+    setInterviewPhase('Complete', 'Your feedback is in the conversation.', 'Finishing the closing audio.');
     questionCount.hidden = true;
-    setStatus('Ended');
+    setProgress(4, true);
+    scheduleAutomaticEnd();
   } else if (entry.event === 'interview_ended_early') {
-    setInterviewPhase('Ended', 'Interview ended early.', 'Select End session to release your microphone.');
+    setInterviewPhase('Ended early', 'Interview ended early.', 'Finishing the closing audio.');
     questionCount.hidden = true;
-    setStatus('Ended');
+    scheduleAutomaticEnd();
   } else if (entry.event === 'clarification_limit') {
     guidance.textContent = 'Answer the current question, or say “end the interview” to stop.';
     if (errorLabel.hidden) setStatus('Listening');
@@ -173,8 +240,14 @@ function handleEvent(message) {
   }
 }
 
-function endSession() {
+function finishSession({ manual = false } = {}) {
+  if (sessionClosed) return;
+  sessionClosed = true;
+  terminalPending = true;
   attempt += 1;
+  if (cleanupTimeout !== null) clearTimeout(cleanupTimeout);
+  cleanupTimeout = null;
+  stopTimer();
   offerAbort?.abort();
   offerAbort = null;
   channel?.close();
@@ -186,10 +259,27 @@ function endSession() {
   audio.pause();
   audio.srcObject = null;
   startButton.disabled = false;
+  startButton.textContent = 'Start again';
   endButton.disabled = true;
-  setInterviewPhase('Ended', 'Session ended.');
-  questionCount.hidden = true;
+  if (manual) {
+    setInterviewPhase('Ended', 'Session ended.');
+    questionCount.hidden = true;
+  } else {
+    guidance.textContent = 'Your microphone is off. You can start again.';
+  }
   setStatus('Ended');
+}
+
+function endSession() { finishSession({ manual: true }); }
+
+function scheduleAutomaticEnd() {
+  terminalPending = true;
+  setStatus('Finishing');
+  const endingAttempt = attempt;
+  // Output-stop is server-side. Allow a bounded interval for browser playout to drain.
+  cleanupTimeout = setTimeout(() => {
+    if (endingAttempt === attempt) finishSession();
+  }, 1200);
 }
 
 async function waitForIce(pc) {
@@ -211,7 +301,12 @@ async function waitForIce(pc) {
 }
 
 async function startSession() {
+  if (!sessionClosed) return;
   const thisAttempt = ++attempt;
+  sessionClosed = false;
+  terminalPending = false;
+  stopTimer();
+  elapsed.textContent = '00:00';
   errorLabel.hidden = true;
   delete errorLabel.dataset.kind;
   const empty = document.createElement('li');
@@ -221,9 +316,11 @@ async function startSession() {
   utterances.clear();
   prepared.clear();
   answers.clear();
+  jumpLatest.hidden = true;
   document.querySelector('#session-id').textContent = 'Connecting to a session';
   setInterviewPhase('Opening', 'We’ll start with a quick hello.', 'Allow microphone access when prompted.');
   questionCount.hidden = true;
+  setProgress();
   startButton.disabled = true;
   endButton.disabled = false;
   setStatus('Connecting');
@@ -264,7 +361,11 @@ async function startSession() {
     peer.ontrack = (event) => {
       if (thisAttempt !== attempt) return;
       audio.srcObject = event.streams[0] || new MediaStream([event.track]);
-      audio.play().catch(() => showError('Audio playback was blocked. Allow audio in your browser and retry.'));
+      audio.play().catch(() => {
+        if (thisAttempt === attempt) {
+          showError('Audio playback was blocked. Allow audio in your browser and retry.');
+        }
+      });
     };
     peer.onconnectionstatechange = () => {
       if (thisAttempt !== attempt || !peer) return;

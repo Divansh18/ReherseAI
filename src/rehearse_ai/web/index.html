@@ -19,6 +19,8 @@
           <span id="connection" role="status" aria-live="polite">Ready</span>
           <span class="status-separator" aria-hidden="true">·</span>
           <span id="microphone">Microphone off</span>
+          <span class="status-separator" aria-hidden="true">·</span>
+          <time id="elapsed" aria-label="Session elapsed time">00:00</time>
         </div>
       </header>
 
@@ -28,16 +30,21 @@
             <h2 id="interview-heading">Interview</h2>
             <span id="question-count" class="progress" hidden>01 / 04</span>
           </div>
+          <div id="question-progress" class="progress-track" role="img" aria-label="Interview has not started">
+            <span></span><span></span><span></span><span></span>
+          </div>
           <div class="interview-content">
             <p id="phase-label" class="phase-label">Before you begin</p>
             <p id="question" class="question" aria-live="polite">Four questions about your project, followed by short feedback.</p>
           </div>
           <p id="guidance" class="guidance">Take a moment to find a project you’d like to talk about.</p>
-          <div class="controls">
-            <button id="start" class="primary" type="button">Start interview</button>
-            <button id="end" class="secondary" type="button" disabled>End session</button>
+          <div class="interview-footer">
+            <div class="controls">
+              <button id="start" class="primary" type="button">Start interview</button>
+              <button id="end" class="secondary" type="button" disabled>End session</button>
+            </div>
+            <p class="disclosure">The coach’s voice is AI-generated. Allow microphone access when prompted.</p>
           </div>
-          <p class="disclosure">The coach’s voice is AI-generated. Allow microphone access when prompted.</p>
         </section>
 
         <section class="card conversation-card" aria-labelledby="transcript-heading">
@@ -45,9 +52,12 @@
             <h2 id="transcript-heading">Conversation</h2>
             <span class="card-caption">Live transcript</span>
           </div>
-          <ol id="transcript" class="transcript" aria-live="polite" aria-relevant="additions text">
+          <ol id="transcript" class="transcript" tabindex="0" aria-label="Conversation transcript" aria-live="polite" aria-relevant="additions text">
             <li class="empty">Your conversation will appear here when you begin.</li>
           </ol>
+          <div class="conversation-footer">
+            <button id="jump-latest" class="jump-latest" type="button" hidden>Jump to latest</button>
+          </div>
         </section>
       </div>
 
@@ -56,7 +66,7 @@
         <summary>Diagnostics</summary>
         <p id="session-id">No session yet</p>
         <p id="build-id">Build __BUILD_ID__</p>
-        <p>Agent text appears when server output starts. Browser playback is not confirmed.</p>
+        <p>Agent text appears when server output starts. Browser playback is not confirmed. Automatic cleanup follows the server output-stop event plus a short drain allowance.</p>
       </details>
       <audio id="remote-audio" autoplay></audio>
     </main>
