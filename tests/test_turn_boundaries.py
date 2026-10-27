@@ -9,6 +9,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection
 
+from rehearse_ai.export_session import build_export
 from rehearse_ai.interview import QUESTIONS, Stage
 from rehearse_ai.pipeline import InterviewInput
 from rehearse_ai.session import InterviewSession
@@ -99,8 +100,12 @@ async def test_multiple_final_stt_segments_one_turn_and_one_decision(tmp_path):
         "segment-2",
         "segment-3",
     ]
+    assert [row["turn_number"] for row in segments] == [1, 1, 1]
+    assert segments[0]["turn_correlation"] == "pre_start_segment"
     assert [row["segment_count"] for row in rows if row["event"] == "candidate_final"] == [3]
     assert len([row for row in rows if row["event"] == "inference_started"]) == 1
+    latency, _, _ = build_export(rows)
+    assert latency[0]["stt_final_ms"] == segments[-1]["session_elapsed_ms"]
 
 
 @pytest.mark.asyncio

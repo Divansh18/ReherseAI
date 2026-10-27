@@ -134,6 +134,7 @@ class InterviewInput(FrameProcessor):
                         frame_timestamp=frame.timestamp,
                         finalized=frame.finalized,
                         frame_id=frame.id,
+                        pre_start=not self._turn_open,
                     )
                     if self._turn_open:
                         await self.session.detect_stop_from_segments(" ".join(self._segments))
@@ -184,7 +185,8 @@ class AudioObserver(FrameProcessor):
                 if not self.session.tts_audio_chunk(frame.context_id, len(frame.audio)):
                     return
             elif isinstance(frame, TTSStoppedFrame):
-                self.session.tts_finished(frame.context_id)
+                if not self.session.tts_finished(frame.context_id):
+                    return
         await self.push_frame(frame, direction)
 
 

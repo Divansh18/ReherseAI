@@ -70,6 +70,9 @@ def build_export(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], st
     for index, final in enumerate(finals):
         turn = final.get("turn_number")
         prior_sequence = finals[index - 1]["sequence"] if index else 0
+        window = [
+            event for event in events if prior_sequence < event["sequence"] <= final["sequence"]
+        ]
         next_start = next(
             (
                 event["sequence"]
@@ -86,7 +89,30 @@ def build_export(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], st
         starts = [event for event in same_turn if event["event"] == "candidate_started"]
         window_start = starts[0]["sequence"] if starts else prior_sequence + 1
         stops = [event for event in same_turn if event["event"] == "vad_stopped"]
-        segments = [event for event in same_turn if event["event"] == "stt_final_segment"]
+        window_segments = [event for event in window if event["event"] == "stt_final_segment"]
+        expected_count = final.get("segment_count")
+
+        def matches_final(segments: list[dict[str, Any]]) -> bool:
+            return (
+                bool(segments)
+                and (not isinstance(expected_count, int) or len(segments) == expected_count)
+                and " ".join(str(event.get("text") or "").strip() for event in segments)
+                == str(final.get("text") or "").strip()
+            )
+
+        all_tagged = all(event.get("turn_number") == turn for event in window_segments)
+        if matches_final(window_segments) and (all_tagged or isinstance(expected_count, int)):
+            segments = window_segments
+            stt_basis = (
+                "logged_turn_number_and_accumulated_text"
+                if all_tagged
+                else "legacy_event_order_and_accumulated_text"
+            )
+        else:
+            segments = []
+            stt_basis = (
+                "ambiguous_segment_correlation" if window_segments else "no_stt_segment_observed"
+            )
         after = [event for event in events if final["sequence"] < event["sequence"] < next_start]
         prepared = [event for event in after if event["event"] == "agent_prepared"]
         response_ids = {event["utterance_id"] for event in prepared}
@@ -135,6 +161,7 @@ def build_export(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], st
             "turn": turn,
             "user_stopped_ms": _speech_end_from_vad(stops[-1]) if stops else None,
             "stt_final_ms": _ms(segments[-1]) if segments else None,
+            "stt_final_basis": stt_basis,
             "llm_first_token_ms": None,
             "tts_first_audio_ms": _ms(output),
             "interrupted": interrupted,
@@ -182,6 +209,9 @@ def build_export(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], st
         if not row["interrupted"]
     ]
     response_latencies = [value for value in eligible if value is not None]
+    ambiguous_stt_count = sum(
+        row["stt_final_basis"] == "ambiguous_segment_correlation" for row in rows
+    )
 
     def average(label: str, pairs: list[tuple[float | None, float | None]]) -> str:
         values = [elapsed for start, end in pairs if (elapsed := _duration(start, end)) is not None]
@@ -205,6 +235,11 @@ def build_export(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], st
             "`tts_first_audio_ms` is a correlated **server output start proxy**, not measured "
             "browser playback. Provider first-audio is separately recorded in the extra column. "
             "The current structured LLM call exposes no first-token event, so that field is null.",
+            "STT finals use their logged turn ID and accumulated text. Older pre-start "
+            "segments are linked by event order only when the complete text and segment count "
+            "match; ambiguous or absent STT timestamps remain null. "
+            f"Ambiguous STT correlation: {ambiguous_stt_count} "
+            f"turn{'s' if ambiguous_stt_count != 1 else ''}.",
             "",
             "## User speech end to first server output",
             "",

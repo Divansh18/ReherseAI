@@ -352,14 +352,21 @@ class InterviewSession:
             self._record(signal, speaker="candidate", turn_number=self._turn_number, **details)
 
     def transcript_segment(
-        self, text: str, *, frame_timestamp: str, finalized: bool, frame_id: int
+        self,
+        text: str,
+        *,
+        frame_timestamp: str,
+        finalized: bool,
+        frame_id: int,
+        pre_start: bool = False,
     ) -> None:
         if not self._closed:
             self._record(
                 "stt_final_segment",
                 speaker="candidate",
                 text=text,
-                turn_number=self._turn_number,
+                turn_number=self._turn_number + int(pre_start),
+                turn_correlation="pre_start_segment" if pre_start else "active_turn",
                 frame_timestamp=frame_timestamp,
                 finalized=finalized,
                 frame_id=frame_id,
@@ -2016,19 +2023,28 @@ class InterviewSession:
                 browser_playback_onset_ms=None,
             )
 
-    def tts_finished(self, context_id: str | None) -> None:
+    def tts_finished(self, context_id: str | None) -> bool:
         utterance_id = self._tts_contexts.pop(context_id or "", None)
-        if utterance_id is not None:
-            self._tts_completed_ids.add(utterance_id)
-            stats = self._tts_audio_stats.get(context_id or "", [0, 0])
-            self._record(
-                "tts_generation_finished",
-                speaker=None,
-                utterance_id=utterance_id,
-                tts_context_id=context_id,
-                audio_chunks=stats[0],
-                audio_bytes=stats[1],
-            )
+        if utterance_id is None:
+            if not self._closed:
+                self._record(
+                    "stale_tts_stop_discarded",
+                    speaker=None,
+                    tts_context_id=context_id,
+                    utterance_id=self._tts_context_history.get(context_id or ""),
+                )
+            return False
+        self._tts_completed_ids.add(utterance_id)
+        stats = self._tts_audio_stats.get(context_id or "", [0, 0])
+        self._record(
+            "tts_generation_finished",
+            speaker=None,
+            utterance_id=utterance_id,
+            tts_context_id=context_id,
+            audio_chunks=stats[0],
+            audio_bytes=stats[1],
+        )
+        return True
 
     def bot_started(self) -> None:
         pending = self.controller.pending
@@ -2036,6 +2052,14 @@ class InterviewSession:
             return
         if pending.id not in self._first_audio_ids:
             return
+        if self._cancelled_output_stop_debt:
+            self._record(
+                "cancelled_output_stop_debt_retired",
+                speaker=None,
+                count=self._cancelled_output_stop_debt,
+                replacement_utterance_id=pending.id,
+            )
+            self._cancelled_output_stop_debt = 0
         self._speaking_id = pending.id
         self._output_started_ids.add(pending.id)
         elapsed = (

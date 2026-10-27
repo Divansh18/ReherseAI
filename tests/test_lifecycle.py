@@ -3,6 +3,7 @@ import json
 
 import pytest
 from pipecat.frames.frames import (
+    BotStoppedSpeakingFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
@@ -12,6 +13,8 @@ from pipecat.frames.frames import (
     UserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
+from pipecat.transports.base_output import BaseOutputTransport
+from pipecat.transports.base_transport import TransportParams
 
 from rehearse_ai.interview import QUESTIONS, Stage
 from rehearse_ai.pipeline import AudioObserver, InterviewInput, UtteranceMarkerFrame
@@ -140,6 +143,114 @@ async def test_audio_from_cancelled_tts_context_is_not_forwarded(tmp_path):
         for row in events(log)
     )
     assert any(row["event"] == "stale_tts_audio_discarded" for row in events(log))
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_late_cancelled_tts_stop_cannot_finish_fresh_output(tmp_path):
+    async def infer(_kind, _payload):
+        raise AssertionError("No inference expected")
+
+    async def speak(_utterance):
+        pass
+
+    log = SessionLog(tmp_path, "late-stop")
+    session = InterviewSession(log, infer, speak, lambda _: None)
+    observer = AudioObserver()
+    observer.session = session
+    forwarded_stops = []
+
+    class Output:
+        async def push_frame(self, frame, direction=FrameDirection.DOWNSTREAM):
+            if direction is FrameDirection.DOWNSTREAM and isinstance(
+                frame, BotStoppedSpeakingFrame
+            ):
+                session.bot_stopped()
+
+    sender = BaseOutputTransport.MediaSender(
+        Output(),
+        destination=None,
+        sample_rate=24000,
+        audio_chunk_size=4800,
+        params=TransportParams(),
+    )
+
+    async def forward(frame, direction=FrameDirection.DOWNSTREAM):
+        if isinstance(frame, TTSStoppedFrame):
+            forwarded_stops.append(frame.context_id)
+            await sender._handle_frame(frame)
+
+    observer.push_frame = forward
+    await session.start()
+    first = session.controller.pending
+    session.tts_context_assigned(first.id, "old")
+    await observer.process_frame(TTSStartedFrame(context_id="old"), FrameDirection.DOWNSTREAM)
+    await observer.process_frame(
+        TTSAudioRawFrame(b"\x01" * 32, 24000, 1, context_id="old"),
+        FrameDirection.DOWNSTREAM,
+    )
+    session.bot_started()
+    await session.user_started()
+    session.bot_stopped()  # Pipecat's interruption stop retires A's stop debt.
+
+    second = session.controller.retry_interrupted()
+    await session._queue_speech(second)
+    session.tts_context_assigned(second.id, "new")
+    await observer.process_frame(TTSStartedFrame(context_id="new"), FrameDirection.DOWNSTREAM)
+    await observer.process_frame(
+        TTSAudioRawFrame(b"\x02" * 32, 24000, 1, context_id="new"),
+        FrameDirection.DOWNSTREAM,
+    )
+    session.bot_started()
+    sender._bot_speaking = True
+    sender._tts_audio_received = True
+
+    await observer.process_frame(
+        TTSAudioRawFrame(b"\x03" * 32, 24000, 1, context_id="old"),
+        FrameDirection.DOWNSTREAM,
+    )
+    await observer.process_frame(TTSStoppedFrame(context_id="old"), FrameDirection.DOWNSTREAM)
+    await observer.process_frame(TTSStoppedFrame(context_id="new"), FrameDirection.DOWNSTREAM)
+    await observer.process_frame(TTSStoppedFrame(context_id="new"), FrameDirection.DOWNSTREAM)
+
+    deliveries = [row for row in events(log) if row["event"] == "agent_delivery_reported"]
+    assert forwarded_stops == ["new"]
+    assert [row["utterance_id"] for row in deliveries] == [second.id]
+    assert session.controller.stage is Stage.AWAITING_GREETING
+    assert not any(row["utterance_id"] == first.id for row in deliveries)
+    assert any(row["event"] == "stale_tts_audio_discarded" for row in events(log))
+    assert len([row for row in events(log) if row["event"] == "stale_tts_stop_discarded"]) == 2
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_output_retires_missing_cancelled_stop_debt(tmp_path):
+    async def infer(_kind, _payload):
+        raise AssertionError("No inference expected")
+
+    async def speak(_utterance):
+        pass
+
+    log = SessionLog(tmp_path, "stop-debt")
+    session = InterviewSession(log, infer, speak, lambda _: None)
+    await session.start()
+    first = session.controller.pending
+    session.tts_started(first.id, "old")
+    session.tts_first_audio("old")
+    session.bot_started()
+    await session.user_started()  # No cancellation BotStopped callback is observed.
+
+    second = session.controller.retry_interrupted()
+    await session._queue_speech(second)
+    session.tts_started(second.id, "new")
+    session.tts_first_audio("new")
+    session.bot_started()
+    session.tts_finished("new")
+    session.bot_stopped()
+
+    deliveries = [row for row in events(log) if row["event"] == "agent_delivery_reported"]
+    assert [row["utterance_id"] for row in deliveries] == [second.id]
+    assert any(row["event"] == "cancelled_output_stop_debt_retired" for row in events(log))
     await session.close()
 
 

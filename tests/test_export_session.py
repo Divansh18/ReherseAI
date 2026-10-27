@@ -114,3 +114,55 @@ def test_nearest_rank_percentiles_and_missing_event_rejection(tmp_path: Path) ->
     )
     with pytest.raises(ValueError, match="ordered"):
         load_events(bad)
+
+
+def test_legacy_prestart_stt_segments_follow_the_completed_turn() -> None:
+    events = [
+        event(1, 10, "stt_final_segment", turn_number=0, text="First"),
+        event(2, 20, "candidate_started", turn_number=1),
+        event(3, 30, "stt_final_segment", turn_number=1, text="answer"),
+        event(4, 40, "candidate_final", turn_number=1, text="First answer", segment_count=2),
+        event(5, 50, "agent_prepared", utterance_id=1, text="Next question"),
+        event(6, 55, "agent_interrupted", utterance_id=1),
+        event(7, 60, "stt_final_segment", turn_number=1, text="Second"),
+        event(8, 70, "candidate_started", turn_number=2),
+        event(9, 80, "stt_final_segment", turn_number=2, text="answer"),
+        event(10, 90, "candidate_final", turn_number=2, text="Second answer", segment_count=2),
+    ]
+    rows, _, _ = build_export(events)
+    assert [row["stt_final_ms"] for row in rows] == [30, 80]
+    assert [row["stt_final_basis"] for row in rows] == [
+        "legacy_event_order_and_accumulated_text",
+        "legacy_event_order_and_accumulated_text",
+    ]
+    assert rows[0]["interrupted"] is True  # The response to turn one was interrupted.
+
+
+def test_ambiguous_or_missing_stt_remains_null() -> None:
+    events = [
+        event(1, 10, "stt_final_segment", turn_number=0, text="Possible extra"),
+        event(2, 20, "candidate_started", turn_number=1),
+        event(3, 30, "stt_final_segment", turn_number=1, text="Answer"),
+        event(4, 40, "candidate_final", turn_number=1, text="Answer", segment_count=1),
+        event(5, 50, "candidate_started", turn_number=2),
+        event(6, 60, "candidate_final", turn_number=2, text="No STT event", segment_count=0),
+    ]
+    rows, _, summary = build_export(events)
+    assert [row["stt_final_ms"] for row in rows] == [None, None]
+    assert [row["stt_final_basis"] for row in rows] == [
+        "ambiguous_segment_correlation",
+        "no_stt_segment_observed",
+    ]
+    assert "Ambiguous STT correlation: 1 turn" in summary
+
+
+def test_legacy_prestart_without_segment_count_is_not_inferred() -> None:
+    rows, _, _ = build_export(
+        [
+            event(1, 10, "stt_final_segment", turn_number=0, text="Hello"),
+            event(2, 20, "candidate_started", turn_number=1),
+            event(3, 30, "candidate_final", turn_number=1, text="Hello"),
+        ]
+    )
+    assert rows[0]["stt_final_ms"] is None
+    assert rows[0]["stt_final_basis"] == "ambiguous_segment_correlation"
