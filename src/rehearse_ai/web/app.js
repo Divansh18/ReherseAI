@@ -110,7 +110,7 @@ function scrollIfNear(nearBottom) {
 }
 
 transcript.addEventListener('scroll', () => {
-  if (nearTranscriptBottom()) jumpLatest.hidden = true;
+  jumpLatest.hidden = nearTranscriptBottom();
 });
 jumpLatest.addEventListener('click', () => {
   transcript.scrollTop = transcript.scrollHeight;
@@ -123,10 +123,6 @@ function addTurn(speaker, text, id = null) {
   transcript.querySelector('.empty')?.remove();
   const item = document.createElement('li');
   item.className = speaker === 'candidate' ? 'candidate' : 'agent';
-  const avatar = document.createElement('span');
-  avatar.className = 'avatar';
-  avatar.setAttribute('aria-hidden', 'true');
-  avatar.textContent = speaker === 'candidate' ? 'Y' : 'R';
   const message = document.createElement('div');
   message.className = 'message';
   const label = document.createElement('span');
@@ -136,7 +132,7 @@ function addTurn(speaker, text, id = null) {
   copy.className = 'message-copy';
   copy.textContent = text;
   message.append(label, copy);
-  item.append(avatar, message);
+  item.append(message);
   transcript.append(item);
   scrollIfNear(nearBottom);
   if (id !== null) utterances.set(id, item);

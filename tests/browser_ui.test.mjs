@@ -110,6 +110,8 @@ test('queued speech stays out of transcript; output, interruption, and candidate
   assert.equal(nodes.connection.textContent, 'Thinking');
   send({ event: 'agent_output_started', utterance_id: 1 });
   assert.equal(nodes.transcript.children[0].querySelector('.speaker').textContent, 'RehearseAI');
+  assert.equal(nodes.transcript.children[0].children[0].className, 'message');
+  assert.equal(nodes.transcript.children[0].children[0].children[0].className, 'speaker');
   assert.equal(nodes.connection.textContent, 'Speaking');
   send({ event: 'agent_interrupted', utterance_id: 1 });
   assert.equal(nodes.transcript.children[0].querySelector('.annotation').textContent, 'Interrupted');
@@ -132,6 +134,8 @@ test('transcript does not snap back when reader has scrolled up', () => {
   const { nodes, send } = fixture();
   send({ event: 'candidate_final', answer_number: 1, text: 'First segment.' });
   assert.equal(nodes.transcript.scrollTop, 0);
+  nodes.transcript.onscroll();
+  assert.equal(nodes['jump-latest'].hidden, false);
   nodes.transcript.scrollTop = 100;
   send({ event: 'candidate_final', answer_number: 1, text: 'Second segment.' });
   assert.equal(nodes.transcript.scrollTop, 100);
