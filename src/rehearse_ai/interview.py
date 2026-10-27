@@ -62,7 +62,6 @@ class ReplyKind(Enum):
     NUDGE = auto()
     CLARIFICATION = auto()
     ADVANCE = auto()
-    DETOUR = auto()
 
 
 class Readiness(Enum):
@@ -341,10 +340,7 @@ class InterviewController:
                 "Okay. Would you like to continue or finish?",
                 self._question_index,
             )
-        kind = UtteranceKind.DETOUR_ACK if self._name_detour else UtteranceKind.NAME_ACK
-        return self._prepare(
-            kind, "Okay, let's begin.", self._question_index if self._name_detour else None
-        )
+        return self._prepare(UtteranceKind.NAME_ACK, "Okay, let's begin.", None)
 
     def start_name_detour(self, resume_prompt: Utterance | None = None) -> Utterance:
         if self._stage not in {Stage.AWAITING_ANSWER, Stage.AWAITING_PROPOSAL}:
@@ -653,7 +649,7 @@ class InterviewController:
         return self._prepare(utterance_kind, text.strip(), index)
 
     def prepare_feedback(self, text: str) -> Utterance:
-        """Queue actual session feedback supplied by the future LLM adapter."""
+        """Queue validated feedback supplied by the LLM adapter."""
         self._require(Stage.AWAITING_FEEDBACK)
         lines = text.splitlines()
         if not 2 <= len(lines) <= 3 or any(not line.strip() for line in lines):
