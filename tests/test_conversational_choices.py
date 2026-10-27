@@ -281,6 +281,77 @@ async def test_spoken_stop_during_continuation_choice_prevents_late_replay(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_pending_choice_presence_then_repeated_detours_close_cleanly(tmp_path):
+    async def infer(kind, payload):
+        if kind == "opening_ack":
+            return {"text": "Thanks."}
+        if payload["phase"] == "continuation_choice":
+            return {"action": "wait", "text": ""}
+        return {"action": "off_topic", "text": ""}
+
+    session, adapter, spoken, _calls, log = harness(tmp_path, infer)
+    await question_one(session, adapter)
+    await turn(adapter, "Can we talk about real life?")
+    deliver(session)
+    await turn(adapter, "You are so sweet.")
+    assert spoken[-1].kind is UtteranceKind.TOPIC_BOUNDARY
+    deliver(session)
+    await turn(adapter, "Hello? Where you going between?")
+    assert spoken[-1].text.startswith("I'm here.")
+    deliver(session)
+    await turn(adapter, "Tell me about your weekend instead.")
+    assert spoken[-1].kind is UtteranceKind.EARLY_FEEDBACK
+    assert session.controller.answers == ((), (), (), ())
+    assert not any(
+        item.kind is UtteranceKind.QUESTION and item.question_number == 2 for item in spoken
+    )
+    assert any(
+        json.loads(line)["event"] == "continuation_choice_exhausted"
+        for line in log.path.read_text().splitlines()
+    )
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_no_project_choice_recovers_from_latest_real_sequence(tmp_path):
+    async def infer(kind, payload):
+        if kind == "opening_ack":
+            return {"text": "Thanks."}
+        if kind == "early_feedback":
+            return {"lines": ["We'll stop here. Thanks for sharing what you could."]}
+        if payload["phase"] == "interview":
+            if payload["latest_candidate_turn"] == "I'm proud of":
+                return {"action": "wait", "project_status": "unclear", "text": ""}
+            return {"action": "wait", "project_status": "no_example", "tone": "gentle", "text": ""}
+        return {"action": "wait", "project_status": "nontechnical", "text": ""}
+
+    session, adapter, spoken, _calls, log = harness(tmp_path, infer)
+    await question_one(session, adapter)
+    await turn(adapter, "I'm proud of")
+    await turn(adapter, "my love life.")
+    assert spoken[-1].kind is UtteranceKind.NO_PROJECT_INVITE
+    assert "I'm sorry" not in spoken[-1].text
+    deliver(session)
+    await turn(adapter, "I wanna talk about love life.")
+    assert spoken[-1].kind is UtteranceKind.NO_PROJECT_SCOPE
+    deliver(session)
+    await turn(adapter, "You are so sweet.")
+    assert spoken[-1].kind is UtteranceKind.NO_PROJECT_SCOPE
+    deliver(session)
+    await turn(adapter, "Hello? Where you going between?")
+    assert spoken[-1].text.startswith("I'm here.")
+    deliver(session)
+    await turn(adapter, "Can we talk about something else?")
+    assert spoken[-1].kind is UtteranceKind.EARLY_FEEDBACK
+    assert session.controller.answers[1:] == ((), (), ())
+    assert all(item.text != QUESTIONS[1] for item in spoken)
+    rows = [json.loads(line) for line in log.path.read_text().splitlines()]
+    assert any(row["event"] == "no_project_choice_exhausted" for row in rows)
+    assert not any(row["event"] == "response_error" for row in rows)
+    await session.close()
+
+
+@pytest.mark.asyncio
 async def test_project_self_reference_is_a_possible_technical_example(tmp_path):
     async def infer(kind, payload):
         if kind == "opening_ack":

@@ -210,6 +210,8 @@ def _classify_readiness(text: str) -> Readiness:
     words = re.findall(r"[a-z]+", normalized)
     words = [word for index, word in enumerate(words) if index == 0 or word != words[index - 1]]
     normalized = " ".join(words)
+    if normalized in {"no", "nah", "nope"}:
+        return Readiness.DEFERRED
     if _DEFER_READINESS.search(normalized):
         return Readiness.DEFERRED
     if (
@@ -237,6 +239,21 @@ def _fallback_opening_ack(text: str) -> str:
     if re.search(r"\bhow (?:are|r|about) you\b|\bhow's it going\b", text, re.I):
         return "Doing well, thanks."
     return "Thanks for telling me."
+
+
+def _presence_check(text: str) -> bool:
+    return bool(re.match(r"^\s*(?:hello|hi|hey|are you there|can you hear me)\b", text, re.I))
+
+
+def _broad_discouragement(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:not|never)\s+proud\b|\bproud\s+of\s+(?:nothing|no\s+thing)\b"
+            r"|\b(?:hopeless|worthless)\b",
+            text,
+            re.I,
+        )
+    )
 
 
 def _is_stop_request(text: str) -> bool:
@@ -1173,8 +1190,11 @@ class InterviewSession:
                 and action == "ADVANCE"
                 and self.controller.project_established is not True
             ):
+                answer = " ".join(self.controller.answers[0])
                 await self._queue_speech(
-                    self.controller.offer_project_example(gentle=result.get("tone") == "gentle")
+                    self.controller.offer_project_example(
+                        gentle=result.get("tone") == "gentle" and _broad_discouragement(answer)
+                    )
                 )
                 return
         if action == "WAIT":
@@ -1246,10 +1266,11 @@ class InterviewSession:
                     await self._end_early(turn)
                 else:
                     utterance = self.controller.repeat_continuation_choice(
-                        off_topic=action == "OFF_TOPIC"
+                        off_topic=action == "OFF_TOPIC", presence=_presence_check(turn)
                     )
                     if utterance is None:
-                        self._record("continuation_choice_waiting", speaker=None)
+                        self._record("continuation_choice_exhausted", speaker=None)
+                        await self._end_early(turn)
                     else:
                         await self._queue_speech(utterance)
                 return
@@ -1487,14 +1508,17 @@ class InterviewSession:
                     return
                 if phase is Stage.AWAITING_NO_PROJECT_EXAMPLE:
                     await self._queue_speech(self.controller.explain_no_project_scope())
-                elif action == "END":
+                elif action in {"END", "FINISH"}:
                     await self._end_early(turn)
                 else:
-                    self._record(
-                        "no_project_waiting",
-                        speaker=None,
-                        guidance="Say end the interview, or return with a technical example.",
+                    utterance = self.controller.reply_to_no_project_choice(
+                        presence=_presence_check(turn)
                     )
+                    if utterance is None:
+                        self._record("no_project_choice_exhausted", speaker=None)
+                        await self._end_early(turn)
+                    else:
+                        await self._queue_speech(utterance)
                 return
 
             if not self._stop_latched and self.controller.stage is Stage.AWAITING_PROPOSAL:

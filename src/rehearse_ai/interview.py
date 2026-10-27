@@ -33,6 +33,7 @@ NO_PROJECT_SCOPE = (
 MAX_FOLLOW_UPS_PER_QUESTION = 1
 MAX_CLARIFICATIONS_PER_QUESTION = 1
 MAX_OPENING_REPEATS = 1
+MAX_PENDING_CHOICE_REPLIES = 2
 
 
 class Stage(Enum):
@@ -135,6 +136,7 @@ class InterviewController:
         self._detour_resume_prompt: Utterance | None = None
         self._detours = [0] * len(QUESTIONS)
         self._choice_repeats = 0
+        self._no_project_choice_replies = 0
         self._opening_return_to_name = False
         self._opening_coach_replies = 0
         self._project_established: bool | None = None
@@ -424,17 +426,33 @@ class InterviewController:
             UtteranceKind.DETOUR_RESUME, QUESTIONS[self._question_index], self._question_index
         )
 
-    def repeat_continuation_choice(self, *, off_topic: bool = False) -> Utterance | None:
+    def repeat_continuation_choice(
+        self, *, off_topic: bool = False, presence: bool = False
+    ) -> Utterance | None:
         self._require(Stage.AWAITING_CONTINUE_CHOICE)
-        if self._choice_repeats >= 1:
+        if self._choice_repeats >= MAX_PENDING_CHOICE_REPLIES:
             return None
         self._choice_repeats += 1
         text = (
-            "This session is for interview practice. Continue with your project or finish?"
+            "I'm here. Would you like to continue the interview or finish?"
+            if presence
+            else "This session is for interview practice. Continue with your project or finish?"
             if off_topic
             else "Would you like to continue the interview or finish here?"
         )
         return self._prepare(UtteranceKind.TOPIC_BOUNDARY, text, self._question_index)
+
+    def reply_to_no_project_choice(self, *, presence: bool = False) -> Utterance | None:
+        self._require(Stage.AWAITING_NO_PROJECT_CHOICE)
+        if self._no_project_choice_replies >= MAX_PENDING_CHOICE_REPLIES:
+            return None
+        self._no_project_choice_replies += 1
+        text = (
+            "I'm here. Would you like to try a technical example or finish?"
+            if presence
+            else "This practice needs a technical example. Would you like to try one or finish?"
+        )
+        return self._prepare(UtteranceKind.NO_PROJECT_SCOPE, text, 0)
 
     def restore_answers(self, answers: tuple[str, ...]) -> None:
         self._require(Stage.AWAITING_PROPOSAL)

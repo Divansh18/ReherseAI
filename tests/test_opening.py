@@ -368,7 +368,7 @@ async def test_natural_affirmative_readiness_routes_to_question_one(tmp_path, re
 
 
 @pytest.mark.parametrize(
-    "response", ["I'm not ready yet.", "Don't start.", "Yes, but give me a moment."]
+    "response", ["No.", "I'm not ready yet.", "Don't start.", "Yes, but give me a moment."]
 )
 @pytest.mark.asyncio
 async def test_deferred_readiness_does_not_start_question_one(tmp_path, response):
