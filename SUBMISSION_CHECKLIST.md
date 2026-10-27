@@ -13,12 +13,13 @@ The assignment brief is in the local `takehome-voice-agent.zip`. This checklist 
 - Raw per-session timing and transcript instrumentation: `src/rehearse_ai/session_log.py`, `src/rehearse_ai/session.py`, `src/rehearse_ai/pipeline.py`.
 - Evidence export command and synthetic checks: `src/rehearse_ai/export_session.py`, `tests/test_export_session.py`, `RECORDING.md`.
 - Direct-provider diagnostic data, explicitly separate from end-to-end latency: `TTS_COMPARISON.md`, `samples/tts-comparison-2026-10-26/measurements.json`.
+- Author-confirmed [Loom recording](https://www.loom.com/share/928bba7d68ec4174856488a0ed2e1bb7) matched to local session `d564949d-6780-414f-8192-22bae9e9345d`; exported `transcript.txt`, `latency.jsonl`, and `latency_summary.md` are in the Git-ignored `recordings/d564949d-6780-414f-8192-22bae9e9345d/` folder. `RECORDING.md` gives the exact command and timing limitations.
 
 ## Pending before submission
 
-- **Real 3–5 minute screen recording with audio** of one session containing a normal answer, mid-answer pause, and interruption. Add a real link and scenario timestamps to `RECORDING.md` after capture.
-- **`transcript.txt` and `latency.jsonl` from that same recorded session**, exported with the command in `RECORDING.md`, reviewed, and deliberately added to the submission. Raw development sessions are not substitutes.
-- **Recording-session latency p50/p95 and stage averages**, copied from its `latency_summary.md` with the documented server-output proxy and missing first-token/browser-playback fields. No recording-session result is claimed yet.
+- Verify the normal answer, mid-answer pause, and interruption in the Loom video; scenario timestamps are pending. The local log reaches all four questions but ends early after requested provisional feedback, so do not claim normal final feedback from this recording.
+- Review and deliberately include the private, Git-ignored recording-session export in the final submission. It has not been committed or uploaded.
+- Decide whether to cite the recording-session latency summary after reviewing the video and measurement limits. Its 12 eligible turns have server-output p50 **2798.9 ms** and p95 **5007.3 ms** (nearest rank); these are not browser playback times. First-token and browser-onset timestamps are unavailable.
 - Author's **honest approximate active time spent** in `README.md`; Git history cannot establish it. Add any AI tools used beyond the known Codex assistance.
 - Final human microphone/listening check of four-question completion, short pause, interruption, spoken stop, and closing feedback on the recorded build.
 - Choose GitHub repository/access or a ZIP retaining `.git`, then submit it separately. No remote is configured and nothing was pushed by this preparation.
